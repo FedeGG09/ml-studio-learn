@@ -1,0 +1,8 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ml-studio",
+  "compatibility_date": "2026-04-13",
+  "assets": {
+    "directory": "./dist"
+  }
+}
