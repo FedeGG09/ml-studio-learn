@@ -1,4 +1,12 @@
 export interface Env {
+      { ok: false, error: error?.message ?? "Error ejecutando SQL" },
+      { status: 400, headers: corsHeaders(env.CORS_ORIGIN) }
+    );
+  }
+}
+
+async function handleExperiments(request: Request, env: Env) {
+  const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/api/experiments") {
     const { results } = await env.DB.prepare(
