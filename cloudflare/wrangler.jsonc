@@ -1,0 +1,28 @@
+{
+  "name": "ml-studio-learn-api",
+  "main": "./functions/worker.ts",
+  "compatibility_date": "2026-04-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    {
+      "pattern": "api.tudominio.com/*",
+      "zone_name": "tudominio.com"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ml_studio_learn",
+      "database_id": "REEMPLAZAR_CON_ID_REAL"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "ml-studio-learn-files"
+    }
+  ],
+  "vars": {
+    "CORS_ORIGIN": "https://ml-studio-dgh.pages.dev"
+  }
+}
