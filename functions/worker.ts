@@ -1,60 +1,4 @@
 export interface Env {
-    const body = await parseJson(request);
-    if (!body?.name || !body?.source_type) {
-      return json({ ok: false, error: "Faltan campos requeridos" }, { status: 400, headers: corsHeaders(env.CORS_ORIGIN) });
-    }
-
-    const result = await env.DB.prepare(
-      `INSERT INTO datasets (name, description, source_type, storage_key, preview_key, row_count, column_count, target_column)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        body.name,
-        body.description ?? null,
-        body.source_type,
-        body.storage_key ?? null,
-        body.preview_key ?? null,
-        body.row_count ?? null,
-        body.column_count ?? null,
-        body.target_column ?? null,
-      )
-      .run();
-
-    return json({ ok: true, dataset_id: result.meta.last_row_id }, { status: 201, headers: corsHeaders(env.CORS_ORIGIN) });
-  }
-
-  if (request.method === "DELETE" && url.pathname.startsWith("/api/datasets/")) {
-    const id = Number(url.pathname.split("/")[3]);
-    await env.DB.prepare("DELETE FROM dataset_columns WHERE dataset_id = ?").bind(id).run();
-    await env.DB.prepare("DELETE FROM datasets WHERE id = ?").bind(id).run();
-    return json({ ok: true }, { headers: corsHeaders(env.CORS_ORIGIN) });
-  }
-
-  return null;
-}
-
-async function handleSql(request: Request, env: Env) {
-  if (request.method !== "POST" || new URL(request.url).pathname !== "/api/sql/execute") return null;
-
-  const body = await parseJson(request);
-  if (!body?.query) {
-    return json({ ok: false, error: "query es requerido" }, { status: 400, headers: corsHeaders(env.CORS_ORIGIN) });
-  }
-
-  try {
-    const stmt = env.DB.prepare(body.query);
-    const { results, meta } = await stmt.all();
-    return json({ ok: true, results, meta }, { headers: corsHeaders(env.CORS_ORIGIN) });
-  } catch (error: any) {
-    return json(
-      { ok: false, error: error?.message ?? "Error ejecutando SQL" },
-      { status: 400, headers: corsHeaders(env.CORS_ORIGIN) }
-    );
-  }
-}
-
-async function handleExperiments(request: Request, env: Env) {
-  const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/api/experiments") {
     const { results } = await env.DB.prepare(
@@ -66,4 +10,59 @@ async function handleExperiments(request: Request, env: Env) {
   if (request.method === "POST" && url.pathname === "/api/experiments") {
     const body = await parseJson(request);
     if (!body?.dataset_id || !body?.experiment_name || !body?.problem_type || !body?.target_column) {
-      return json({ ok: false, error: "Faltan campos requeridos" }, { status: 400, header
+      return json({ ok: false, error: "Faltan campos requeridos" }, { status: 400, headers: corsHeaders(env.CORS_ORIGIN) });
+    }
+
+    const result = await env.DB.prepare(
+      `INSERT INTO experiments (dataset_id, experiment_name, problem_type, target_column, train_size, test_size, random_state)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        body.dataset_id,
+        body.experiment_name,
+        body.problem_type,
+        body.target_column,
+        body.train_size ?? 0.8,
+        body.test_size ?? 0.2,
+        body.random_state ?? 42,
+      )
+      .run();
+
+    return json({ ok: true, experiment_id: result.meta.last_row_id }, { status: 201, headers: corsHeaders(env.CORS_ORIGIN) });
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/api/experiments/") && url.pathname.endsWith("/runs")) {
+    const id = Number(url.pathname.split("/")[3]);
+    const { results } = await env.DB.prepare(
+      "SELECT * FROM model_runs WHERE experiment_id = ? ORDER BY id DESC"
+    ).bind(id).all();
+    return json({ ok: true, runs: results }, { headers: corsHeaders(env.CORS_ORIGIN) });
+  }
+
+  return null;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders(env.CORS_ORIGIN) });
+    }
+
+    const url = new URL(request.url);
+
+    const datasets = await handleDatasets(request, env);
+    if (datasets) return datasets;
+
+    const sql = await handleSql(request, env);
+    if (sql) return sql;
+
+    const experiments = await handleExperiments(request, env);
+    if (experiments) return experiments;
+
+    if (url.pathname === "/api/health") {
+      return json({ ok: true, service: "ml-studio-learn-api" }, { headers: corsHeaders(env.CORS_ORIGIN) });
+    }
+
+    return json({ ok: false, error: "Not found" }, { status: 404, headers: corsHeaders(env.CORS_ORIGIN) });
+  },
+};
