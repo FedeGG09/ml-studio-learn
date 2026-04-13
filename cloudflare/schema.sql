@@ -1,10 +1,7 @@
 CREATE TABLE IF NOT EXISTS datasets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  description TEXT,
-  source_type TEXT NOT NULL,       -- csv | sql
-  storage_key TEXT,                -- ruta en R2 o path lógico
-  preview_key TEXT,                -- preview cacheado
+  source_type TEXT NOT NULL,
+  storage_key TEXT,
+  preview_key TEXT,
   row_count INTEGER,
   column_count INTEGER,
   target_column TEXT,
@@ -36,7 +33,7 @@ CREATE TABLE IF NOT EXISTS experiments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   dataset_id INTEGER NOT NULL,
   experiment_name TEXT NOT NULL,
-  problem_type TEXT NOT NULL,      -- regression | classification
+  problem_type TEXT NOT NULL,
   target_column TEXT NOT NULL,
   train_size REAL NOT NULL DEFAULT 0.8,
   test_size REAL NOT NULL DEFAULT 0.2,
@@ -49,7 +46,7 @@ CREATE TABLE IF NOT EXISTS model_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   experiment_id INTEGER NOT NULL,
   model_name TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued', -- queued | running | done | failed
+  status TEXT NOT NULL DEFAULT 'queued',
   started_at TEXT,
   finished_at TEXT,
   duration_ms INTEGER,
@@ -61,4 +58,22 @@ CREATE TABLE IF NOT EXISTS model_configs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id INTEGER NOT NULL,
   params_json TEXT NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES model_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS metrics (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  metric_name TEXT NOT NULL,
+  metric_value REAL NOT NULL,
+  FOREIGN KEY (run_id) REFERENCES model_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  artifact_type TEXT NOT NULL,
+  artifact_key TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (run_id) REFERENCES model_runs(id)
 );
