@@ -1,8 +1,0 @@
-name = "ml-studio-learn"
-pages_build_output_dir = "./dist"
-compatibility_date = "2026-04-13"
-compatibility_flags = ["nodejs_compat"]
-
-[vars]
-VITE_APP_NAME = "ML Studio Learn"
-VITE_ENV = "production"
