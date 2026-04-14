@@ -28,7 +28,13 @@ const App = () => (
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/upload" element={<UploadDataset />} />
+
+            {/* Explorer legacy */}
             <Route path="/explorer" element={<DatasetExplorer />} />
+
+            {/* Nuevo explorer dinámico */}
+            <Route path="/datasets/:id" element={<DatasetExplorer />} />
+
             <Route path="/sql-lab" element={<SqlLab />} />
             <Route path="/data-viz" element={<DataViz />} />
             <Route path="/model-lab" element={<ModelLab />} />
