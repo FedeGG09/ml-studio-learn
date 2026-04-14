@@ -1,345 +1,516 @@
-import { useMemo, useState } from "react";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { useLocation, useSearchParams, Link } from "react-router-dom";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExplanationBox } from "@/components/ExplanationBox";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
-import { Brain, Play, Info, FlaskConical } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Brain, Play, Info, FlaskConical, Rocket, Trophy, RefreshCcw } from "lucide-react";
+import { toast } from "sonner";
 
-const models = {
-  regression: [
-    "Linear Regression",
-    "Ridge",
-    "Lasso",
-    "SVR",
-    "Decision Tree",
-  ],
-  classification: [
-    "Logistic Regression",
-    "KNN",
-    "SVM",
-    "Naive Bayes",
-    "Random Forest",
-    "XGBoost",
-    "AdaBoost",
-  ],
+type TaskType = "regression" | "classification";
+
+type ModelSpec = { name: string; defaults: Record<string, string | number | boolean> };
+
+const fallbackModels: Record<TaskType, string[]> = {
+  regression: ["Linear Regression", "Ridge", "Lasso", "SVR", "Decision Tree"],
+  classification: ["Logistic Regression", "KNN", "SVM", "Naive Bayes", "Random Forest", "XGBoost", "AdaBoost"],
 };
 
 const hyperparamsMap: Record<
   string,
-  {
-    label: string;
-    min: number;
-    max: number;
-    step: number;
-    default: number;
-    explanation: string;
-  }[]
+  { label: string; min: number; max: number; step: number; default: number; explanation: string }[]
 > = {
   "Linear Regression": [],
-  Ridge: [
-    {
-      label: "alpha",
-      min: 0.01,
-      max: 10,
-      step: 0.01,
-      default: 1,
-      explanation:
-        "Controla cuánto penalizamos coeficientes grandes.",
-    },
-  ],
-  Lasso: [
-    {
-      label: "alpha",
-      min: 0.01,
-      max: 10,
-      step: 0.01,
-      default: 1,
-      explanation:
-        "Puede eliminar variables irrelevantes automáticamente.",
-    },
-  ],
+  Ridge: [{ label: "alpha", min: 0.01, max: 10, step: 0.01, default: 1, explanation: "Penaliza coeficientes grandes." }],
+  Lasso: [{ label: "alpha", min: 0.01, max: 10, step: 0.01, default: 1, explanation: "Puede eliminar variables irrelevantes." }],
   SVR: [
-    {
-      label: "C",
-      min: 0.1,
-      max: 100,
-      step: 0.1,
-      default: 1,
-      explanation: "Penalización por errores.",
-    },
-    {
-      label: "epsilon",
-      min: 0.01,
-      max: 1,
-      step: 0.01,
-      default: 0.1,
-      explanation: "Margen de tolerancia del error.",
-    },
+    { label: "C", min: 0.1, max: 100, step: 0.1, default: 1, explanation: "Penalización por errores." },
+    { label: "epsilon", min: 0.01, max: 1, step: 0.01, default: 0.1, explanation: "Margen de tolerancia." },
   ],
   "Decision Tree": [
-    {
-      label: "max_depth",
-      min: 1,
-      max: 30,
-      step: 1,
-      default: 5,
-      explanation: "Profundidad máxima del árbol.",
-    },
+    { label: "max_depth", min: 1, max: 30, step: 1, default: 5, explanation: "Profundidad máxima del árbol." },
+    { label: "min_samples_split", min: 2, max: 50, step: 1, default: 2, explanation: "Mínimo de muestras para dividir." },
   ],
   "Logistic Regression": [
-    {
-      label: "C",
-      min: 0.01,
-      max: 100,
-      step: 0.01,
-      default: 1,
-      explanation: "Regularización del modelo.",
-    },
+    { label: "C", min: 0.01, max: 100, step: 0.01, default: 1, explanation: "Regularización del modelo." },
+    { label: "max_iter", min: 100, max: 5000, step: 100, default: 1000, explanation: "Iteraciones máximas." },
   ],
   KNN: [
-    {
-      label: "n_neighbors",
-      min: 1,
-      max: 50,
-      step: 1,
-      default: 5,
-      explanation: "Cantidad de vecinos.",
-    },
+    { label: "n_neighbors", min: 1, max: 50, step: 1, default: 5, explanation: "Cantidad de vecinos." },
   ],
   SVM: [
-    {
-      label: "C",
-      min: 0.1,
-      max: 100,
-      step: 0.1,
-      default: 1,
-      explanation: "Penalización por errores.",
-    },
+    { label: "C", min: 0.1, max: 100, step: 0.1, default: 1, explanation: "Penalización por errores." },
+    { label: "kernel", min: 0, max: 2, step: 1, default: 0, explanation: "0=linear, 1=rbf, 2=poly" },
   ],
   "Naive Bayes": [],
   "Random Forest": [
-    {
-      label: "n_estimators",
-      min: 10,
-      max: 500,
-      step: 10,
-      default: 100,
-      explanation: "Cantidad de árboles.",
-    },
-    {
-      label: "max_depth",
-      min: 1,
-      max: 30,
-      step: 1,
-      default: 10,
-      explanation: "Profundidad máxima.",
-    },
+    { label: "n_estimators", min: 10, max: 500, step: 10, default: 100, explanation: "Cantidad de árboles." },
+    { label: "max_depth", min: 1, max: 30, step: 1, default: 10, explanation: "Profundidad máxima." },
   ],
   XGBoost: [
-    {
-      label: "n_estimators",
-      min: 10,
-      max: 500,
-      step: 10,
-      default: 100,
-      explanation: "Boosting rounds.",
-    },
+    { label: "n_estimators", min: 10, max: 500, step: 10, default: 100, explanation: "Boosting rounds." },
+    { label: "learning_rate", min: 0.01, max: 1, step: 0.01, default: 0.1, explanation: "Tasa de aprendizaje." },
+    { label: "max_depth", min: 1, max: 15, step: 1, default: 6, explanation: "Profundidad máxima." },
   ],
   AdaBoost: [
-    {
-      label: "n_estimators",
-      min: 10,
-      max: 500,
-      step: 10,
-      default: 50,
-      explanation: "Cantidad de estimadores.",
-    },
+    { label: "n_estimators", min: 10, max: 500, step: 10, default: 50, explanation: "Cantidad de estimadores." },
+    { label: "learning_rate", min: 0.01, max: 2, step: 0.01, default: 1, explanation: "Peso de cada estimador." },
   ],
 };
 
+type TrainResult = {
+  model: string;
+  success: boolean;
+  score: number | null;
+  error?: string | null;
+  duration_ms: number;
+  params?: Record<string, string | number | boolean>;
+  metrics?: Record<string, number> | null;
+};
+
 export default function ModelLab() {
-  const navigate = useNavigate();
   const location = useLocation();
+  const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
 
-  const datasetId = location.state?.datasetId ?? 1;
-  const datasetName = location.state?.datasetName ?? "Dataset";
+  const locationState = (location.state ?? {}) as any;
+  const datasetId = Number(searchParams.get("datasetId") ?? locationState.datasetId ?? 1);
+  const targetFromUrl = searchParams.get("target") ?? locationState.target ?? "";
+  const problemTypeFromUrl = searchParams.get("problemType") as TaskType | null;
 
-  const [taskType, setTaskType] = useState<
-    "regression" | "classification"
-  >("classification");
-
-  const [selectedModel, setSelectedModel] = useState("Random Forest");
+  const [taskType, setTaskType] = useState<TaskType>(problemTypeFromUrl ?? "classification");
+  const [selectedModel, setSelectedModel] = useState<string>("Random Forest");
   const [trainSplit, setTrainSplit] = useState([80]);
   const [params, setParams] = useState<Record<string, number>>({});
-  const [benchmarkResults, setBenchmarkResults] = useState<any[]>([]);
+  const [singleResult, setSingleResult] = useState<TrainResult | null>(null);
+  const [benchmarkResults, setBenchmarkResults] = useState<TrainResult[]>([]);
+  const [running, setRunning] = useState(false);
 
-  const hyperparams = hyperparamsMap[selectedModel] || [];
+  const datasetQuery = useQuery({
+    queryKey: ["dataset-profile", datasetId],
+    queryFn: async () => {
+      const res = await fetch(`/api/datasets/${datasetId}/profile`);
+      return res.json();
+    },
+    enabled: Number.isFinite(datasetId) && datasetId > 0,
+  });
 
-  const getParam = (label: string, def: number) =>
-    params[label] ?? def;
+  const modelsQuery = useQuery({
+    queryKey: ["models"],
+    queryFn: async () => {
+      const res = await fetch("/api/models");
+      return res.json();
+    },
+  });
 
-  const runBenchmark = () => {
-    const results = models[taskType].map((model) => {
-      const success = Math.random() > 0.2;
+  const historyQuery = useQuery({
+    queryKey: ["experiments", datasetId],
+    queryFn: async () => {
+      const res = await fetch(`/api/experiments?datasetId=${datasetId}`);
+      return res.json();
+    },
+    enabled: Number.isFinite(datasetId) && datasetId > 0,
+  });
 
-      if (!success) {
-        return {
-          model,
-          success: false,
-          score: null,
-          error: "Feature mismatch / convergence warning",
-        };
+  const availableModels: string[] = useMemo(() => {
+    const apiModels = modelsQuery.data?.ok ? modelsQuery.data[taskType] : null;
+    if (Array.isArray(apiModels) && apiModels.length > 0) {
+      return apiModels.map((m: ModelSpec | string) => (typeof m === "string" ? m : m.name));
+    }
+    return fallbackModels[taskType];
+  }, [modelsQuery.data, taskType]);
+
+  useEffect(() => {
+    if (problemTypeFromUrl) {
+      setTaskType(problemTypeFromUrl);
+      return;
+    }
+
+    const inferred = datasetQuery.data?.dataset?.inferred_problem_type;
+    if (inferred === "classification" || inferred === "regression") {
+      setTaskType(inferred);
+    }
+  }, [problemTypeFromUrl, datasetQuery.data]);
+
+  useEffect(() => {
+    if (!availableModels.includes(selectedModel)) {
+      setSelectedModel(availableModels[0] ?? "");
+    }
+  }, [availableModels, selectedModel]);
+
+  const datasetName =
+    datasetQuery.data?.dataset?.name ??
+    locationState.datasetName ??
+    `Dataset ${datasetId}`;
+
+  const targetColumn =
+    targetFromUrl ||
+    datasetQuery.data?.dataset?.target_column ||
+    datasetQuery.data?.columns?.find((c: any) => c.is_target)?.column_name ||
+    "";
+
+  const currentHyperparams = hyperparamsMap[selectedModel] ?? [];
+
+  const getParam = (label: string, def: number) => params[label] ?? def;
+
+  const selectedParams = () =>
+    currentHyperparams.reduce<Record<string, number>>((acc, hp) => {
+      acc[hp.label] = getParam(hp.label, hp.default);
+      return acc;
+    }, {});
+
+  const saveCurrentModelParams = (modelName: string) => {
+    if (modelName !== selectedModel) return {};
+    return selectedParams();
+  };
+
+  const runSingle = async () => {
+    if (!datasetId || !selectedModel || !targetColumn) {
+      toast.error("Seleccioná dataset y target antes de entrenar");
+      return;
+    }
+
+    setRunning(true);
+    try {
+      const payload = {
+        datasetId,
+        taskType,
+        targetColumn,
+        trainSplit: trainSplit[0],
+        modelName: selectedModel,
+        paramsByModel: {
+          [selectedModel]: selectedParams(),
+        },
+        experimentName: `Single run - ${selectedModel}`,
+      };
+
+      const res = await fetch("/api/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || "Training failed");
       }
 
-      return {
-        model,
-        success: true,
-        score: Number((Math.random() * 0.3 + 0.7).toFixed(3)),
-      };
-    });
+      const best = data.ranking?.[0] as TrainResult | undefined;
+      setSingleResult(best ?? null);
+      setBenchmarkResults(data.ranking ?? []);
+      await queryClient.invalidateQueries({ queryKey: ["experiments", datasetId] });
 
-    setBenchmarkResults(
-      results.sort((a, b) => (b.score || 0) - (a.score || 0))
-    );
+      toast.success("Entrenamiento completado");
+    } catch (err: any) {
+      toast.error(err?.message ?? "Error entrenando modelo");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const runBenchmark = async () => {
+    if (!datasetId || !targetColumn) {
+      toast.error("Seleccioná dataset y target antes de benchmarkear");
+      return;
+    }
+
+    setRunning(true);
+    try {
+      const payload = {
+        datasetId,
+        taskType,
+        targetColumn,
+        trainSplit: trainSplit[0],
+        models: availableModels,
+        paramsByModel: {
+          [selectedModel]: selectedParams(),
+        },
+        experimentName: `Benchmark - ${taskType} - ${datasetName}`,
+      };
+
+      const res = await fetch("/api/train-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || "Benchmark failed");
+      }
+
+      setBenchmarkResults(data.ranking ?? []);
+      await queryClient.invalidateQueries({ queryKey: ["experiments", datasetId] });
+
+      toast.success("Benchmark completado");
+    } catch (err: any) {
+      toast.error(err?.message ?? "Error ejecutando benchmark");
+    } finally {
+      setRunning(false);
+    }
   };
 
   return (
     <div className="space-y-8 max-w-7xl">
-      <div>
-        <h1 className="section-title">Model Lab</h1>
-        <p className="section-subtitle mt-1">
-          Dataset: <span className="text-primary">{datasetName}</span>
-        </p>
+      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+        <div>
+          <h1 className="section-title">Model Lab</h1>
+          <p className="section-subtitle mt-1">
+            Configura y entrena modelos de Machine Learning
+          </p>
+          <div className="mt-2 text-sm text-muted-foreground">
+            Dataset: <span className="text-foreground font-medium">{datasetName}</span> · Target:{" "}
+            <span className="text-foreground font-medium">{targetColumn || "pendiente"}</span>
+          </div>
+        </div>
+
+        <Link
+          to={`/datasets/${datasetId}`}
+          className="inline-flex items-center gap-2 rounded-xl px-5 py-3 bg-primary text-primary-foreground hover:opacity-90 transition-all shadow-lg"
+        >
+          <Rocket className="h-4 w-4" />
+          Volver al dataset
+        </Link>
       </div>
 
       <ExplanationBox
         technicalTitle="Técnico: Entrenamiento de modelos"
-        technicalContent="Benchmark multi-modelo sobre dataset dinámico con tolerancia a errores por modelo."
+        technicalContent="Se implementa un pipeline con preprocessing, train/test split, entrenamiento con hiperparámetros y evaluación. El benchmark corre todos los modelos y guarda experimentos, métricas y artifacts en D1."
         didacticTitle="Sencillo: ¿Qué hago aquí?"
-        didacticContent="Podés probar un modelo puntual o correr todos para descubrir cuál funciona mejor."
+        didacticContent="Elegís si querés predecir un número o una categoría, ajustás parámetros o probás todos los modelos, y el sistema guarda los resultados para compararlos."
       />
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="space-y-4">
-          <div className="glass-card p-5">
-            <h3 className="font-heading font-semibold text-sm mb-4">
-              Tipo de tarea
-            </h3>
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm">Tipo de tarea</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex gap-2">
+                {(["regression", "classification"] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => {
+                      setTaskType(t);
+                      setSelectedModel((fallbackModels[t][0] ?? ""));
+                      setParams({});
+                      setSingleResult(null);
+                    }}
+                    className={`flex-1 py-2 rounded-lg text-xs font-medium transition-all ${
+                      taskType === t
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted/50 text-muted-foreground"
+                    }`}
+                  >
+                    {t === "regression" ? "Regresión" : "Clasificación"}
+                  </button>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
 
-            <div className="flex gap-2">
-              {(["regression", "classification"] as const).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => {
-                    setTaskType(t);
-                    setSelectedModel(models[t][0]);
-                    setParams({});
-                  }}
-                  className={`flex-1 py-2 rounded-lg text-xs ${
-                    taskType === t
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted/50"
-                  }`}
-                >
-                  {t === "regression"
-                    ? "Regresión"
-                    : "Clasificación"}
-                </button>
-              ))}
-            </div>
-          </div>
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm">Modelo</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-1">
+                {availableModels.map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => {
+                      setSelectedModel(m);
+                      setParams({});
+                      setSingleResult(null);
+                    }}
+                    className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-all ${
+                      selectedModel === m
+                        ? "bg-primary/15 text-primary font-medium"
+                        : "text-muted-foreground hover:bg-muted/30"
+                    }`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
 
-          <div className="glass-card p-5">
-            <h3 className="font-heading font-semibold text-sm mb-4">
-              Modelo
-            </h3>
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm">Train / Test Split</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <Slider
+                value={trainSplit}
+                onValueChange={setTrainSplit}
+                min={50}
+                max={95}
+                step={5}
+                className="mb-2"
+              />
+              <div className="flex justify-between text-xs text-muted-foreground">
+                <span>Train: {trainSplit[0]}%</span>
+                <span>Test: {100 - trainSplit[0]}%</span>
+              </div>
+            </CardContent>
+          </Card>
 
-            {models[taskType].map((m) => (
-              <button
-                key={m}
-                onClick={() => setSelectedModel(m)}
-                className={`w-full text-left px-3 py-2 rounded-lg text-sm mb-1 ${
-                  selectedModel === m
-                    ? "bg-primary/15 text-primary"
-                    : "hover:bg-muted/30"
-                }`}
-              >
-                {m}
-              </button>
-            ))}
-          </div>
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm">Historial del dataset</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {historyQuery.isLoading ? (
+                <p className="text-sm text-muted-foreground">Cargando historial...</p>
+              ) : historyQuery.data?.experiments?.length ? (
+                historyQuery.data.experiments.map((exp: any) => (
+                  <div key={exp.id} className="rounded-2xl border border-border/60 p-3">
+                    <div className="text-sm font-medium">{exp.experiment_name}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {exp.problem_type} · target: {exp.target_column}
+                    </div>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      Runs: {exp.run_count} · Best: {exp.best_model ?? "—"}{" "}
+                      {exp.best_score !== null && exp.best_score !== undefined ? `(${exp.best_score})` : ""}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-muted-foreground">Todavía no hay experimentos.</p>
+              )}
+            </CardContent>
+          </Card>
         </div>
 
         <div className="lg:col-span-2 space-y-4">
-          <div className="glass-card p-5">
-            <div className="flex items-center gap-2 mb-5">
-              <Brain className="h-5 w-5 text-primary" />
-              <h3 className="font-heading font-semibold">
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm flex items-center gap-2">
+                <Brain className="h-5 w-5 text-primary" />
                 {selectedModel}
-              </h3>
-            </div>
-
-            {hyperparams.map((hp) => (
-              <div key={hp.label} className="mb-5">
-                <div className="flex justify-between mb-2">
-                  <span>{hp.label}</span>
-                  <span>{getParam(hp.label, hp.default)}</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {currentHyperparams.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  Este modelo no tiene hiperparámetros ajustables.
+                </p>
+              ) : (
+                <div className="space-y-6">
+                  {currentHyperparams.map((hp) => (
+                    <div key={hp.label}>
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="text-sm font-mono font-medium">
+                          {hp.label}
+                        </label>
+                        <span className="text-sm font-mono text-primary font-bold">
+                          {getParam(hp.label, hp.default)}
+                        </span>
+                      </div>
+                      <Slider
+                        value={[getParam(hp.label, hp.default)]}
+                        onValueChange={([v]) =>
+                          setParams({ ...params, [hp.label]: v })
+                        }
+                        min={hp.min}
+                        max={hp.max}
+                        step={hp.step}
+                        className="mb-1"
+                      />
+                      <div className="flex items-start gap-1.5 mt-2">
+                        <Info className="h-3 w-3 text-muted-foreground mt-0.5 shrink-0" />
+                        <p className="text-xs text-muted-foreground">
+                          {hp.explanation}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
                 </div>
+              )}
+            </CardContent>
+          </Card>
 
-                <Slider
-                  value={[getParam(hp.label, hp.default)]}
-                  onValueChange={([v]) =>
-                    setParams({ ...params, [hp.label]: v })
-                  }
-                  min={hp.min}
-                  max={hp.max}
-                  step={hp.step}
-                />
-              </div>
-            ))}
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <Button className="h-12 gap-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Button
+              className="h-12 font-heading font-semibold text-base gap-2"
+              onClick={runSingle}
+              disabled={running}
+            >
               <Play className="h-4 w-4" />
               Entrenar modelo
             </Button>
 
             <Button
               variant="secondary"
-              className="h-12 gap-2"
+              className="h-12 font-heading font-semibold text-base gap-2"
               onClick={runBenchmark}
+              disabled={running}
             >
               <FlaskConical className="h-4 w-4" />
               Benchmark all models
             </Button>
           </div>
 
+          {singleResult && (
+            <Card className="glass-card">
+              <CardHeader>
+                <CardTitle className="text-sm">Último entrenamiento</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm">
+                <div>Modelo: {singleResult.model}</div>
+                <div>Estado: {singleResult.success ? "Done" : "Failed"}</div>
+                <div>
+                  Score: {singleResult.score !== null ? singleResult.score : "—"}
+                </div>
+                <div>Duración: {singleResult.duration_ms} ms</div>
+                {singleResult.error && (
+                  <div className="text-red-500">{singleResult.error}</div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
           {benchmarkResults.length > 0 && (
-            <div className="glass-card p-5">
-              <h3 className="font-heading font-semibold mb-4">
-                Ranking de modelos
-              </h3>
-
-              <div className="space-y-2">
-                {benchmarkResults.map((r, idx) => (
+            <Card className="glass-card">
+              <CardHeader>
+                <CardTitle className="text-sm flex items-center gap-2">
+                  <Trophy className="h-4 w-4" />
+                  Ranking de modelos
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {benchmarkResults.map((r: any, idx: number) => (
                   <div
-                    key={r.model}
-                    className="flex justify-between text-sm border-b pb-2"
+                    key={`${r.model}-${idx}`}
+                    className="flex flex-col md:flex-row md:items-center md:justify-between gap-2 border-b border-border/50 pb-3"
                   >
-                    <span>
-                      #{idx + 1} {r.model}
-                    </span>
+                    <div>
+                      <div className="font-medium text-sm">
+                        #{idx + 1} {r.model}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {r.success ? "Success" : "Failed"} · {r.duration_ms} ms
+                      </div>
+                    </div>
 
-                    <span>
-                      {r.success
-                        ? `Score: ${r.score}`
-                        : `❌ ${r.error}`}
-                    </span>
+                    <div className="text-sm md:text-right">
+                      {r.success ? (
+                        <div>
+                          Score: <span className="font-semibold">{r.score}</span>
+                        </div>
+                      ) : (
+                        <div className="text-red-500">{r.error}</div>
+                      )}
+                    </div>
                   </div>
                 ))}
-              </div>
-            </div>
+              </CardContent>
+            </Card>
           )}
         </div>
       </div>
