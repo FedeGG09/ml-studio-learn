@@ -5,12 +5,21 @@ import { ExplanationBox } from "@/components/ExplanationBox";
 import { Button } from "@/components/ui/button";
 import { Slider } from "@/components/ui/slider";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Brain, Play, Info, FlaskConical, Rocket, Trophy, RefreshCcw } from "lucide-react";
+import { Brain, Play, Info, FlaskConical, Rocket, Trophy } from "lucide-react";
 import { toast } from "sonner";
+import { apiGet, apiPost } from "@/api/client";
 
 type TaskType = "regression" | "classification";
 
-type ModelSpec = { name: string; defaults: Record<string, string | number | boolean> };
+type TrainResult = {
+  model: string;
+  success: boolean;
+  score: number | null;
+  error?: string | null;
+  duration_ms: number;
+  params?: Record<string, string | number | boolean>;
+  metrics?: Record<string, number> | null;
+};
 
 const fallbackModels: Record<TaskType, string[]> = {
   regression: ["Linear Regression", "Ridge", "Lasso", "SVR", "Decision Tree"],
@@ -59,16 +68,6 @@ const hyperparamsMap: Record<
   ],
 };
 
-type TrainResult = {
-  model: string;
-  success: boolean;
-  score: number | null;
-  error?: string | null;
-  duration_ms: number;
-  params?: Record<string, string | number | boolean>;
-  metrics?: Record<string, number> | null;
-};
-
 export default function ModelLab() {
   const location = useLocation();
   const queryClient = useQueryClient();
@@ -89,34 +88,25 @@ export default function ModelLab() {
 
   const datasetQuery = useQuery({
     queryKey: ["dataset-profile", datasetId],
-    queryFn: async () => {
-      const res = await fetch(`/api/datasets/${datasetId}/profile`);
-      return res.json();
-    },
+    queryFn: () => apiGet(`/api/datasets/${datasetId}/profile`),
     enabled: Number.isFinite(datasetId) && datasetId > 0,
   });
 
   const modelsQuery = useQuery({
     queryKey: ["models"],
-    queryFn: async () => {
-      const res = await fetch("/api/models");
-      return res.json();
-    },
+    queryFn: () => apiGet("/api/models"),
   });
 
   const historyQuery = useQuery({
     queryKey: ["experiments", datasetId],
-    queryFn: async () => {
-      const res = await fetch(`/api/experiments?datasetId=${datasetId}`);
-      return res.json();
-    },
+    queryFn: () => apiGet(`/api/experiments?datasetId=${datasetId}`),
     enabled: Number.isFinite(datasetId) && datasetId > 0,
   });
 
   const availableModels: string[] = useMemo(() => {
-    const apiModels = modelsQuery.data?.ok ? modelsQuery.data[taskType] : null;
+    const apiModels = modelsQuery.data?.ok ? (modelsQuery.data as any)[taskType] : null;
     if (Array.isArray(apiModels) && apiModels.length > 0) {
-      return apiModels.map((m: ModelSpec | string) => (typeof m === "string" ? m : m.name));
+      return apiModels.map((m: any) => (typeof m === "string" ? m : m.name));
     }
     return fallbackModels[taskType];
   }, [modelsQuery.data, taskType]);
@@ -127,7 +117,7 @@ export default function ModelLab() {
       return;
     }
 
-    const inferred = datasetQuery.data?.dataset?.inferred_problem_type;
+    const inferred = (datasetQuery.data as any)?.dataset?.inferred_problem_type;
     if (inferred === "classification" || inferred === "regression") {
       setTaskType(inferred);
     }
@@ -140,14 +130,14 @@ export default function ModelLab() {
   }, [availableModels, selectedModel]);
 
   const datasetName =
-    datasetQuery.data?.dataset?.name ??
+    (datasetQuery.data as any)?.dataset?.name ??
     locationState.datasetName ??
     `Dataset ${datasetId}`;
 
   const targetColumn =
     targetFromUrl ||
-    datasetQuery.data?.dataset?.target_column ||
-    datasetQuery.data?.columns?.find((c: any) => c.is_target)?.column_name ||
+    (datasetQuery.data as any)?.dataset?.target_column ||
+    (datasetQuery.data as any)?.columns?.find((c: any) => c.is_target)?.column_name ||
     "";
 
   const currentHyperparams = hyperparamsMap[selectedModel] ?? [];
@@ -160,11 +150,6 @@ export default function ModelLab() {
       return acc;
     }, {});
 
-  const saveCurrentModelParams = (modelName: string) => {
-    if (modelName !== selectedModel) return {};
-    return selectedParams();
-  };
-
   const runSingle = async () => {
     if (!datasetId || !selectedModel || !targetColumn) {
       toast.error("Seleccioná dataset y target antes de entrenar");
@@ -173,7 +158,7 @@ export default function ModelLab() {
 
     setRunning(true);
     try {
-      const payload = {
+      const data = await apiPost<any>("/api/train", {
         datasetId,
         taskType,
         targetColumn,
@@ -183,17 +168,9 @@ export default function ModelLab() {
           [selectedModel]: selectedParams(),
         },
         experimentName: `Single run - ${selectedModel}`,
-      };
-
-      const res = await fetch("/api/train", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
       });
 
-      const data = await res.json();
-
-      if (!res.ok || !data.ok) {
+      if (!data.ok) {
         throw new Error(data.error || "Training failed");
       }
 
@@ -218,7 +195,7 @@ export default function ModelLab() {
 
     setRunning(true);
     try {
-      const payload = {
+      const data = await apiPost<any>("/api/train-all", {
         datasetId,
         taskType,
         targetColumn,
@@ -228,17 +205,9 @@ export default function ModelLab() {
           [selectedModel]: selectedParams(),
         },
         experimentName: `Benchmark - ${taskType} - ${datasetName}`,
-      };
-
-      const res = await fetch("/api/train-all", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
       });
 
-      const data = await res.json();
-
-      if (!res.ok || !data.ok) {
+      if (!data.ok) {
         throw new Error(data.error || "Benchmark failed");
       }
 
@@ -296,7 +265,7 @@ export default function ModelLab() {
                     key={t}
                     onClick={() => {
                       setTaskType(t);
-                      setSelectedModel((fallbackModels[t][0] ?? ""));
+                      setSelectedModel(fallbackModels[t][0] ?? "");
                       setParams({});
                       setSingleResult(null);
                     }}
@@ -367,8 +336,8 @@ export default function ModelLab() {
             <CardContent className="space-y-3">
               {historyQuery.isLoading ? (
                 <p className="text-sm text-muted-foreground">Cargando historial...</p>
-              ) : historyQuery.data?.experiments?.length ? (
-                historyQuery.data.experiments.map((exp: any) => (
+              ) : (historyQuery.data as any)?.experiments?.length ? (
+                (historyQuery.data as any).experiments.map((exp: any) => (
                   <div key={exp.id} className="rounded-2xl border border-border/60 p-3">
                     <div className="text-sm font-medium">{exp.experiment_name}</div>
                     <div className="text-xs text-muted-foreground">

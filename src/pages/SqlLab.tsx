@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ExplanationBox } from "@/components/ExplanationBox";
 import { Play, Clock3, Database, FileCode2, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
+import { apiGet, apiPost } from "@/api/client";
 
 type QueryResult = {
   ok: boolean;
@@ -64,10 +65,12 @@ export default function SqlLab() {
   const loadHistory = async () => {
     setHistoryLoading(true);
     try {
-      const url = datasetId ? `/api/sql/history?datasetId=${datasetId}` : `/api/sql/history`;
-      const res = await fetch(url);
-      const data = await res.json();
+      const data = await apiGet<{ ok: boolean; queries: HistoryItem[] }>(
+        datasetId ? `/api/sql/history?datasetId=${datasetId}` : "/api/sql/history"
+      );
       if (data.ok) setHistory(data.queries ?? []);
+    } catch (err: any) {
+      toast.error(err?.message ?? "Error cargando historial");
     } finally {
       setHistoryLoading(false);
     }
@@ -83,23 +86,13 @@ export default function SqlLab() {
     setResult(null);
 
     try {
-      const res = await fetch("/api/sql/execute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query,
-          datasetId,
-          queryName: "Manual SQL",
-        }),
+      const data = await apiPost<QueryResult>("/api/sql/execute", {
+        query,
+        datasetId,
+        queryName: "Manual SQL",
       });
 
-      const data = await res.json();
       setResult(data);
-
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || "SQL execution failed");
-      }
-
       toast.success("Consulta ejecutada");
       loadHistory();
     } catch (err: any) {

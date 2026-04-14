@@ -2,12 +2,12 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ExplanationBox } from "@/components/ExplanationBox";
-import { Upload, FileText, Loader2, CheckCircle2, ArrowRight } from "lucide-react";
+import { Upload, Loader2, CheckCircle2, ArrowRight } from "lucide-react";
 import { toast } from "sonner";
+import { apiPostForm } from "@/api/client";
 
 type ImportResult = {
   ok: boolean;
@@ -89,15 +89,10 @@ export default function UploadDataset() {
       form.append("targetColumn", targetColumn);
       form.append("problemType", problemType);
 
-      const response = await fetch("/api/datasets/import", {
-        method: "POST",
-        body: form,
-      });
+      const data = await apiPostForm<ImportResult>("/api/datasets/import", form);
 
-      const data = (await response.json()) as ImportResult & { error?: string };
-
-      if (!response.ok || !data.ok) {
-        throw new Error(data.error || "No se pudo importar el dataset");
+      if (!data.ok) {
+        throw new Error("No se pudo importar el dataset");
       }
 
       setResult(data);
