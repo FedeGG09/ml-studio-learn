@@ -4,6 +4,7 @@ import { Toaster as Sonner } from "@/components/ui/sonner";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { DashboardLayout } from "@/components/DashboardLayout";
+
 import HomePage from "./pages/HomePage";
 import UploadDataset from "./pages/UploadDataset";
 import DatasetExplorer from "./pages/DatasetExplorer";
@@ -32,7 +33,7 @@ const App = () => (
             {/* Explorer legacy */}
             <Route path="/explorer" element={<DatasetExplorer />} />
 
-            {/* Nuevo explorer dinámico */}
+            {/* Explorer dinámico */}
             <Route path="/datasets/:id" element={<DatasetExplorer />} />
 
             <Route path="/sql-lab" element={<SqlLab />} />

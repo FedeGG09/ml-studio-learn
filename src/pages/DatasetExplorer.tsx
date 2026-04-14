@@ -12,7 +12,9 @@ import {
 
 export default function DatasetExplorer() {
   const { id } = useParams();
-  const datasetId = Number(id || 1);
+
+  // fallback para legacy /explorer
+  const datasetId = Number(id ?? 1);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["dataset-profile", datasetId],
@@ -52,6 +54,7 @@ export default function DatasetExplorer() {
         didacticContent="Esta pantalla muestra tu dataset real almacenado en Cloudflare D1."
       />
 
+      {/* KPIs */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard
           title="Columnas"
@@ -75,7 +78,7 @@ export default function DatasetExplorer() {
         />
       </div>
 
-      {/* Tabla columnas */}
+      {/* Columnas */}
       <div className="glass-card p-5">
         <h3 className="font-heading font-semibold text-sm mb-4">
           Detalle por columna
@@ -107,7 +110,7 @@ export default function DatasetExplorer() {
         </div>
       </div>
 
-      {/* Preview real */}
+      {/* Preview */}
       <div className="glass-card p-5">
         <h3 className="font-heading font-semibold text-sm mb-4">
           Preview del dataset
@@ -117,7 +120,7 @@ export default function DatasetExplorer() {
           <table className="data-table w-full">
             <thead>
               <tr>
-                {Object.keys(preview[0] || {}).map((key) => (
+                {Object.keys(preview?.[0] || {}).map((key) => (
                   <th key={key}>{key}</th>
                 ))}
               </tr>
