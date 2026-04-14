@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router-dom";
+import { useParams, Link } from "react-router-dom";
 import { datasetsApi } from "@/api/datasets";
 import { ExplanationBox } from "@/components/ExplanationBox";
 import { MetricCard } from "@/components/MetricCard";
@@ -8,13 +8,12 @@ import {
   Hash,
   AlertTriangle,
   BarChart,
+  Rocket,
 } from "lucide-react";
 
 export default function DatasetExplorer() {
   const { id } = useParams();
-
-  // fallback para legacy /explorer
-  const datasetId = Number(id ?? 1);
+  const datasetId = Number(id || 1);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["dataset-profile", datasetId],
@@ -40,11 +39,28 @@ export default function DatasetExplorer() {
     ["INTEGER", "REAL"].includes(c.data_type)
   ).length;
 
+  const targetColumn =
+    columns.find((c: any) => c.is_target)?.column_name ||
+    dataset.target_column;
+
+  const problemType = datasetId === 2 ? "classification" : "regression";
+
   return (
     <div className="space-y-8 max-w-7xl">
-      <div>
-        <h1 className="section-title">{dataset.name}</h1>
-        <p className="section-subtitle mt-1">{dataset.description}</p>
+      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+        <div>
+          <h1 className="section-title">{dataset.name}</h1>
+          <p className="section-subtitle mt-1">{dataset.description}</p>
+        </div>
+
+        {/* CTA PREMIUM */}
+        <Link
+          to={`/model-lab?datasetId=${datasetId}&target=${targetColumn}&problemType=${problemType}`}
+          className="inline-flex items-center gap-2 rounded-xl px-5 py-3 bg-primary text-primary-foreground hover:opacity-90 transition-all shadow-lg"
+        >
+          <Rocket className="h-4 w-4" />
+          Open in Model Lab
+        </Link>
       </div>
 
       <ExplanationBox
@@ -54,7 +70,6 @@ export default function DatasetExplorer() {
         didacticContent="Esta pantalla muestra tu dataset real almacenado en Cloudflare D1."
       />
 
-      {/* KPIs */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <MetricCard
           title="Columnas"
@@ -78,7 +93,6 @@ export default function DatasetExplorer() {
         />
       </div>
 
-      {/* Columnas */}
       <div className="glass-card p-5">
         <h3 className="font-heading font-semibold text-sm mb-4">
           Detalle por columna
@@ -110,7 +124,6 @@ export default function DatasetExplorer() {
         </div>
       </div>
 
-      {/* Preview */}
       <div className="glass-card p-5">
         <h3 className="font-heading font-semibold text-sm mb-4">
           Preview del dataset
@@ -120,7 +133,7 @@ export default function DatasetExplorer() {
           <table className="data-table w-full">
             <thead>
               <tr>
-                {Object.keys(preview?.[0] || {}).map((key) => (
+                {Object.keys(preview[0] || {}).map((key) => (
                   <th key={key}>{key}</th>
                 ))}
               </tr>
@@ -138,7 +151,6 @@ export default function DatasetExplorer() {
         </div>
       </div>
 
-      {/* Stats */}
       <div className="glass-card p-5">
         <h3 className="font-heading font-semibold text-sm mb-4">
           Estadísticas
