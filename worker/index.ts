@@ -26,21 +26,35 @@ export default {
     const url = new URL(request.url);
     const { pathname } = url;
 
+    // =========================
+    // Health
+    // =========================
     if (pathname === "/api/health") {
       return json({ ok: true, service: "ml-studio" });
     }
 
+    // =========================
+    // Datasets - list
+    // =========================
     if (pathname === "/api/datasets" && request.method === "GET") {
       const { results } = await env.DB.prepare(
         "SELECT * FROM datasets ORDER BY created_at DESC"
       ).all();
+
       return json({ ok: true, datasets: results });
     }
 
+    // =========================
+    // Datasets - create
+    // =========================
     if (pathname === "/api/datasets" && request.method === "POST") {
       const body = await readJson(request);
+
       if (!body?.name || !body?.source_type) {
-        return json({ ok: false, error: "Faltan campos requeridos" }, { status: 400 });
+        return json(
+          { ok: false, error: "Faltan campos requeridos" },
+          { status: 400 }
+        );
       }
 
       const result = await env.DB.prepare(
@@ -60,13 +74,104 @@ export default {
         )
         .run();
 
-      return json({ ok: true, dataset_id: result.meta.last_row_id }, { status: 201 });
+      return json(
+        { ok: true, dataset_id: result.meta.last_row_id },
+        { status: 201 }
+      );
     }
 
+    // =========================
+    // Dataset profile
+    // =========================
+    const datasetProfileMatch = pathname.match(
+      /^\/api\/datasets\/(\d+)\/profile$/
+    );
+
+    if (datasetProfileMatch && request.method === "GET") {
+      const datasetId = Number(datasetProfileMatch[1]);
+
+      const dataset = await env.DB.prepare(
+        "SELECT * FROM datasets WHERE id = ?"
+      )
+        .bind(datasetId)
+        .first();
+
+      if (!dataset) {
+        return json(
+          { ok: false, error: "Dataset no encontrado" },
+          { status: 404 }
+        );
+      }
+
+      const { results: columns } = await env.DB.prepare(
+        "SELECT * FROM dataset_columns WHERE dataset_id = ? ORDER BY id ASC"
+      )
+        .bind(datasetId)
+        .all();
+
+      let previewQuery: string | null = null;
+      let statsQuery: string | null = null;
+
+      if (datasetId === 1) {
+        previewQuery = `
+          SELECT *
+          FROM retail_sales
+          LIMIT 10
+        `;
+
+        statsQuery = `
+          SELECT
+            COUNT(*) AS total_rows,
+            ROUND(AVG(units_sold), 2) AS avg_target,
+            ROUND(AVG(revenue), 2) AS avg_revenue
+          FROM retail_sales
+        `;
+      } else if (datasetId === 2) {
+        previewQuery = `
+          SELECT *
+          FROM saas_churn
+          LIMIT 10
+        `;
+
+        statsQuery = `
+          SELECT
+            COUNT(*) AS total_rows,
+            ROUND(AVG(churn) * 100, 2) AS churn_rate_pct,
+            ROUND(AVG(mrr_usd), 2) AS avg_mrr
+          FROM saas_churn
+        `;
+      }
+
+      if (!previewQuery || !statsQuery) {
+        return json(
+          { ok: false, error: "Preview no disponible para este dataset" },
+          { status: 400 }
+        );
+      }
+
+      const { results: preview } = await env.DB.prepare(previewQuery).all();
+      const stats = await env.DB.prepare(statsQuery).first();
+
+      return json({
+        ok: true,
+        dataset,
+        columns,
+        preview,
+        stats,
+      });
+    }
+
+    // =========================
+    // SQL Lab
+    // =========================
     if (pathname === "/api/sql/execute" && request.method === "POST") {
       const body = await readJson(request);
+
       if (!body?.query) {
-        return json({ ok: false, error: "query es requerido" }, { status: 400 });
+        return json(
+          { ok: false, error: "query es requerido" },
+          { status: 400 }
+        );
       }
 
       try {
@@ -74,23 +179,42 @@ export default {
         return json({ ok: true, results, meta });
       } catch (error: any) {
         return json(
-          { ok: false, error: error?.message ?? "Error ejecutando SQL" },
+          {
+            ok: false,
+            error: error?.message ?? "Error ejecutando SQL",
+          },
           { status: 400 }
         );
       }
     }
 
+    // =========================
+    // Experiments - list
+    // =========================
     if (pathname === "/api/experiments" && request.method === "GET") {
       const { results } = await env.DB.prepare(
         "SELECT * FROM experiments ORDER BY created_at DESC"
       ).all();
+
       return json({ ok: true, experiments: results });
     }
 
+    // =========================
+    // Experiments - create
+    // =========================
     if (pathname === "/api/experiments" && request.method === "POST") {
       const body = await readJson(request);
-      if (!body?.dataset_id || !body?.experiment_name || !body?.problem_type || !body?.target_column) {
-        return json({ ok: false, error: "Faltan campos requeridos" }, { status: 400 });
+
+      if (
+        !body?.dataset_id ||
+        !body?.experiment_name ||
+        !body?.problem_type ||
+        !body?.target_column
+      ) {
+        return json(
+          { ok: false, error: "Faltan campos requeridos" },
+          { status: 400 }
+        );
       }
 
       const result = await env.DB.prepare(
@@ -109,9 +233,15 @@ export default {
         )
         .run();
 
-      return json({ ok: true, experiment_id: result.meta.last_row_id }, { status: 201 });
+      return json(
+        { ok: true, experiment_id: result.meta.last_row_id },
+        { status: 201 }
+      );
     }
 
+    // =========================
+    // Static assets fallback
+    // =========================
     return env.ASSETS.fetch(request);
   },
 };
