@@ -18,6 +18,9 @@ import {
 } from "recharts";
 import { apiGet, apiPost } from "@/api/client";
 import { ExplanationBox } from "@/components/ExplanationBox";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { CircleHelp, Sparkles, X, ChartColumnBig, Database, WandSparkles } from "lucide-react";
 
 type ChartType = "bar" | "line" | "scatter" | "pie";
 type Aggregation = "sum" | "avg" | "count" | "min" | "max";
@@ -62,13 +65,12 @@ type SqlExecuteResponse = {
   error?: string;
 };
 
-type VisualData = {
+type VisualPoint = {
   label?: string | number;
   value?: number;
   x?: number;
   y?: number;
   name?: string;
-  [key: string]: unknown;
 };
 
 const COLORS = [
@@ -93,26 +95,26 @@ const chartDescriptions: Record<
   bar: {
     technicalTitle: "Técnico: barras agregadas",
     technicalContent:
-      "Se agrupan categorías sobre una columna nominal y se aplica una agregación sobre una variable numérica o un conteo de filas.",
+      "Se agrupan categorías y se aplica una agregación sobre una variable numérica o un conteo de filas para comparar magnitudes entre grupos.",
     didacticTitle: "Sencillo: ¿Cómo funciona?",
     didacticContent:
-      "Sirve para comparar valores entre grupos. Por ejemplo, ventas por región o cantidad de registros por categoría.",
+      "Sirve para comparar valores entre grupos, como ventas por región o cantidad de casos por categoría.",
   },
   line: {
     technicalTitle: "Técnico: serie ordenada",
     technicalContent:
-      "Se ordenan los valores por una dimensión y se visualiza la evolución o el ranking de un indicador agregado.",
+      "Se ordenan los valores por una dimensión y se visualiza la evolución de una métrica agregada en ese orden.",
     didacticTitle: "Sencillo: ¿Cómo funciona?",
     didacticContent:
-      "Te muestra una tendencia. Es útil para ver cómo cambia algo a lo largo de fechas, meses, categorías o secuencias.",
+      "Te muestra una tendencia. Es útil cuando querés ver cómo cambia algo en el tiempo o en un orden natural.",
   },
   scatter: {
     technicalTitle: "Técnico: dispersión numérica",
     technicalContent:
-      "Se proyectan dos variables numéricas en los ejes X e Y para observar correlaciones, clústeres y valores atípicos.",
+      "Se proyectan dos variables numéricas en ejes X e Y para observar correlación, clusters y valores atípicos.",
     didacticTitle: "Sencillo: ¿Cómo funciona?",
     didacticContent:
-      "Cada punto es una observación. Te ayuda a ver si dos números se mueven juntos o no.",
+      "Cada punto es una fila del dataset. Te ayuda a ver si dos números se mueven juntos o no.",
   },
   pie: {
     technicalTitle: "Técnico: composición porcentual",
@@ -120,7 +122,7 @@ const chartDescriptions: Record<
       "Se agregan categorías y se visualiza el peso relativo de cada grupo sobre el total.",
     didacticTitle: "Sencillo: ¿Cómo funciona?",
     didacticContent:
-      "Muestra qué parte representa cada grupo dentro del total. Útil para ver proporciones.",
+      "Muestra qué parte representa cada grupo dentro del total.",
   },
 };
 
@@ -156,7 +158,6 @@ function buildQuery(params: {
   limit: number;
 }) {
   const { chartType, tableName, xColumn, yColumn, aggregation = "sum", limit } = params;
-
   const quotedTable = `"${tableName}"`;
   const safeLimit = Math.max(5, Math.min(limit, 500));
 
@@ -196,6 +197,80 @@ function buildQuery(params: {
   `;
 }
 
+function inferInitialChartType(columns: ColumnMeta[], preview: Record<string, unknown>[]): ChartType {
+  const numericCols = columns.filter((c) => isNumericType(c.data_type));
+  const dateLikeCols = columns.filter((c) => {
+    const firstValue = preview[0]?.[c.column_name];
+    return isDateLike(firstValue);
+  });
+  const categoricalCols = columns.filter((c) => !isNumericType(c.data_type));
+
+  if (numericCols.length >= 2) return "scatter";
+  if (dateLikeCols.length >= 1 && numericCols.length >= 1) return "line";
+  if (categoricalCols.length >= 1 && numericCols.length >= 1) return "bar";
+  return "pie";
+}
+
+function getSmartPreset(profile: DatasetProfileResponse | null) {
+  const columns = profile?.columns ?? [];
+  const preview = profile?.preview ?? [];
+
+  const numericCols = columns.filter((c) => isNumericType(c.data_type));
+  const categoricalCols = columns.filter((c) => !isNumericType(c.data_type));
+  const dateLikeCols = columns.filter((c) => {
+    const firstValue = preview[0]?.[c.column_name];
+    return isDateLike(firstValue);
+  });
+
+  if (numericCols.length >= 2) {
+    return {
+      chartType: "scatter" as ChartType,
+      xColumn: numericCols[0].column_name,
+      yColumn: numericCols[1].column_name,
+      aggregation: "sum" as Aggregation,
+      limit: 200,
+    };
+  }
+
+  if (dateLikeCols.length >= 1 && numericCols.length >= 1) {
+    return {
+      chartType: "line" as ChartType,
+      xColumn: dateLikeCols[0].column_name,
+      yColumn: numericCols[0].column_name,
+      aggregation: "avg" as Aggregation,
+      limit: 24,
+    };
+  }
+
+  if (categoricalCols.length >= 1 && numericCols.length >= 1) {
+    return {
+      chartType: "bar" as ChartType,
+      xColumn: categoricalCols[0].column_name,
+      yColumn: numericCols[0].column_name,
+      aggregation: "sum" as Aggregation,
+      limit: 12,
+    };
+  }
+
+  if (categoricalCols.length >= 1) {
+    return {
+      chartType: "pie" as ChartType,
+      xColumn: categoricalCols[0].column_name,
+      yColumn: "",
+      aggregation: "count" as Aggregation,
+      limit: 8,
+    };
+  }
+
+  return {
+    chartType: "bar" as ChartType,
+    xColumn: columns[0]?.column_name ?? "",
+    yColumn: numericCols[0]?.column_name ?? "",
+    aggregation: "count" as Aggregation,
+    limit: 12,
+  };
+}
+
 export default function DataViz() {
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -214,7 +289,8 @@ export default function DataViz() {
   const [yColumn, setYColumn] = useState("");
   const [aggregation, setAggregation] = useState<Aggregation>("sum");
   const [limit, setLimit] = useState(12);
-  const [chartData, setChartData] = useState<VisualData[]>([]);
+  const [chartData, setChartData] = useState<VisualPoint[]>([]);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const dataset = useMemo(() => {
     return datasets.find((d) => Number(d.id) === Number(selectedDatasetId)) ?? null;
@@ -223,23 +299,7 @@ export default function DataViz() {
   const columns = profile?.columns ?? [];
   const numericColumns = columns.filter((c) => isNumericType(c.data_type));
   const categoricalColumns = columns.filter((c) => !isNumericType(c.data_type));
-
   const activeDescription = chartDescriptions[chartType];
-
-  const xOptions = useMemo(() => {
-    if (chartType === "scatter") {
-      return numericColumns;
-    }
-    return [...categoricalColumns, ...numericColumns];
-  }, [chartType, categoricalColumns, numericColumns]);
-
-  const yOptions = useMemo(() => {
-    if (chartType === "scatter") {
-      return numericColumns;
-    }
-    return numericColumns;
-  }, [chartType, numericColumns]);
-
   const currentTableName =
     profile?.dataset?.table_name ||
     profile?.dataset?.storage_key ||
@@ -247,17 +307,31 @@ export default function DataViz() {
     dataset?.storage_key ||
     "";
 
+  const xOptions = useMemo(() => {
+    if (chartType === "scatter") return numericColumns;
+    return [...categoricalColumns, ...numericColumns];
+  }, [chartType, categoricalColumns, numericColumns]);
+
+  const yOptions = useMemo(() => {
+    if (chartType === "scatter") return numericColumns;
+    return numericColumns;
+  }, [chartType, numericColumns]);
+
+  const smartPreset = useMemo(() => getSmartPreset(profile), [profile]);
+
   useEffect(() => {
     const loadDatasets = async () => {
       setLoadingDatasets(true);
       setError(null);
+
       try {
         const data = await apiGet<{ ok: boolean; datasets: DatasetSummary[] }>("/api/datasets");
         if (data.ok) {
-          setDatasets(data.datasets ?? []);
+          const list = data.datasets ?? [];
+          setDatasets(list);
+
           const urlDatasetId = Number(searchParams.get("datasetId") ?? 0);
-          const initialDatasetId =
-            urlDatasetId || Number(data.datasets?.[0]?.id ?? 0) || 0;
+          const initialDatasetId = urlDatasetId || Number(list[0]?.id ?? 0) || 0;
           setSelectedDatasetId(initialDatasetId);
         }
       } catch (err: any) {
@@ -274,26 +348,24 @@ export default function DataViz() {
   useEffect(() => {
     const fetchProfile = async () => {
       if (!selectedDatasetId) return;
+
       setLoadingProfile(true);
       setError(null);
+
       try {
         const data = await apiGet<DatasetProfileResponse>(
           `/api/datasets/${selectedDatasetId}/profile`
         );
+
         if (data.ok) {
           setProfile(data);
 
-          const allColumns = data.columns ?? [];
-          const numeric = allColumns.filter((c) => isNumericType(c.data_type));
-          const categorical = allColumns.filter((c) => !isNumericType(c.data_type));
-
-          if (chartType === "scatter") {
-            setXColumn((prev) => prev || numeric[0]?.column_name || "");
-            setYColumn((prev) => prev || numeric[1]?.column_name || numeric[0]?.column_name || "");
-          } else {
-            setXColumn((prev) => prev || categorical[0]?.column_name || numeric[0]?.column_name || "");
-            setYColumn((prev) => prev || numeric[0]?.column_name || "");
-          }
+          const preset = getSmartPreset(data);
+          setChartType(preset.chartType);
+          setXColumn(preset.xColumn);
+          setYColumn(preset.yColumn);
+          setAggregation(preset.aggregation);
+          setLimit(preset.limit);
         }
       } catch (err: any) {
         setError(err?.message ?? "Error cargando dataset");
@@ -304,14 +376,14 @@ export default function DataViz() {
     };
 
     fetchProfile();
-  }, [selectedDatasetId, chartType]);
+  }, [selectedDatasetId]);
 
   useEffect(() => {
     if (!profile?.dataset?.table_name) return;
-    const tableName = profile.dataset.table_name;
+
     const query = buildQuery({
       chartType,
-      tableName,
+      tableName: profile.dataset.table_name,
       xColumn,
       yColumn,
       aggregation,
@@ -362,7 +434,7 @@ export default function DataViz() {
       } finally {
         setQueryLoading(false);
       }
-    }, 250);
+    }, 220);
 
     return () => window.clearTimeout(timeout);
   }, [profile, chartType, xColumn, yColumn, aggregation, limit, selectedDatasetId]);
@@ -456,8 +528,17 @@ export default function DataViz() {
     );
   };
 
+  const applySmartPreset = () => {
+    const preset = getSmartPreset(profile);
+    setChartType(preset.chartType);
+    setXColumn(preset.xColumn);
+    setYColumn(preset.yColumn);
+    setAggregation(preset.aggregation);
+    setLimit(preset.limit);
+  };
+
   return (
-    <div className="space-y-8 max-w-7xl">
+    <div className="space-y-8 max-w-7xl relative">
       <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
         <div>
           <h1 className="section-title">Data Viz</h1>
@@ -491,10 +572,14 @@ export default function DataViz() {
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="space-y-4">
-          <div className="glass-card p-5">
-            <h3 className="font-heading font-semibold text-sm mb-4">Dataset</h3>
-
-            <div className="space-y-3">
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm flex items-center gap-2">
+                <Database className="h-4 w-4" />
+                Dataset
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
               <label className="text-xs text-muted-foreground">Elegir dataset</label>
               <select
                 className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
@@ -527,35 +612,42 @@ export default function DataViz() {
                   </div>
                 </div>
               )}
-            </div>
-          </div>
+            </CardContent>
+          </Card>
 
-          <div className="glass-card p-5">
-            <h3 className="font-heading font-semibold text-sm mb-4">Tipo de gráfico</h3>
-            <div className="grid grid-cols-2 gap-2">
-              {(["bar", "line", "scatter", "pie"] as ChartType[]).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setChartType(t)}
-                  className={`rounded-xl px-3 py-2 text-sm transition-all ${
-                    chartType === t
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-muted/50 text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {t === "bar" ? "Barra" : t === "line" ? "Línea" : t === "scatter" ? "Scatter" : "Pie"}
-                </button>
-              ))}
-            </div>
-          </div>
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm flex items-center gap-2">
+                <ChartColumnBig className="h-4 w-4" />
+                Tipo de gráfico
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 gap-2">
+                {(["bar", "line", "scatter", "pie"] as ChartType[]).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setChartType(t)}
+                    className={`rounded-xl px-3 py-2 text-sm transition-all ${
+                      chartType === t
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-muted/50 text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {t === "bar" ? "Barra" : t === "line" ? "Línea" : t === "scatter" ? "Scatter" : "Pie"}
+                  </button>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
 
-          <div className="glass-card p-5">
-            <h3 className="font-heading font-semibold text-sm mb-4">Columnas</h3>
-            <div className="space-y-3">
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm">Columnas</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
               <div className="space-y-2">
-                <label className="text-xs text-muted-foreground">
-                  Eje X / Grupo
-                </label>
+                <label className="text-xs text-muted-foreground">Eje X / Grupo</label>
                 <select
                   className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
                   value={xColumn}
@@ -572,9 +664,7 @@ export default function DataViz() {
 
               {chartType === "scatter" ? (
                 <div className="space-y-2">
-                  <label className="text-xs text-muted-foreground">
-                    Eje Y
-                  </label>
+                  <label className="text-xs text-muted-foreground">Eje Y</label>
                   <select
                     className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
                     value={yColumn}
@@ -590,9 +680,7 @@ export default function DataViz() {
                 </div>
               ) : (
                 <div className="space-y-2">
-                  <label className="text-xs text-muted-foreground">
-                    Métrica
-                  </label>
+                  <label className="text-xs text-muted-foreground">Métrica</label>
                   <select
                     className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
                     value={yColumn}
@@ -609,9 +697,7 @@ export default function DataViz() {
               )}
 
               <div className="space-y-2">
-                <label className="text-xs text-muted-foreground">
-                  Agregación
-                </label>
+                <label className="text-xs text-muted-foreground">Agregación</label>
                 <select
                   className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
                   value={aggregation}
@@ -640,30 +726,43 @@ export default function DataViz() {
                   className="w-full"
                 />
               </div>
-            </div>
-          </div>
 
-          <div className="glass-card p-5">
-            <h3 className="font-heading font-semibold text-sm mb-4">Resumen</h3>
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <div className="rounded-xl bg-muted/30 p-3">
-                <div className="text-xs text-muted-foreground">Rows</div>
-                <div className="font-medium">{totalRows}</div>
+              <Button
+                onClick={applySmartPreset}
+                variant="secondary"
+                className="w-full gap-2"
+              >
+                <WandSparkles className="h-4 w-4" />
+                Sugerir configuración
+              </Button>
+            </CardContent>
+          </Card>
+
+          <Card className="glass-card">
+            <CardHeader>
+              <CardTitle className="text-sm">Resumen</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="text-xs text-muted-foreground">Rows</div>
+                  <div className="font-medium">{totalRows}</div>
+                </div>
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="text-xs text-muted-foreground">Columns</div>
+                  <div className="font-medium">{columns.length}</div>
+                </div>
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="text-xs text-muted-foreground">Numéricas</div>
+                  <div className="font-medium">{numericColumns.length}</div>
+                </div>
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="text-xs text-muted-foreground">Categorías</div>
+                  <div className="font-medium">{categoricalColumns.length}</div>
+                </div>
               </div>
-              <div className="rounded-xl bg-muted/30 p-3">
-                <div className="text-xs text-muted-foreground">Columns</div>
-                <div className="font-medium">{columns.length}</div>
-              </div>
-              <div className="rounded-xl bg-muted/30 p-3">
-                <div className="text-xs text-muted-foreground">Numéricas</div>
-                <div className="font-medium">{numericColumns.length}</div>
-              </div>
-              <div className="rounded-xl bg-muted/30 p-3">
-                <div className="text-xs text-muted-foreground">Categorías</div>
-                <div className="font-medium">{categoricalColumns.length}</div>
-              </div>
-            </div>
-          </div>
+            </CardContent>
+          </Card>
         </div>
 
         <div className="lg:col-span-2 space-y-4">
@@ -720,6 +819,68 @@ export default function DataViz() {
           </div>
         </div>
       </div>
+
+      {helpOpen ? (
+        <div className="fixed bottom-6 right-6 z-50 w-[340px] max-w-[calc(100vw-2rem)]">
+          <Card className="shadow-2xl border-border/60">
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between gap-3">
+                <CardTitle className="text-sm flex items-center gap-2">
+                  <Sparkles className="h-4 w-4 text-primary" />
+                  Ayuda rápida
+                </CardTitle>
+                <button
+                  onClick={() => setHelpOpen(false)}
+                  className="rounded-full p-1 hover:bg-muted transition-colors"
+                  aria-label="Cerrar ayuda"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <p className="text-muted-foreground">
+                Esta pantalla te ayuda a convertir datos en gráficos reales sin tocar SQL.
+              </p>
+
+              <div className="space-y-2">
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="font-medium text-xs mb-1">1. Elegí un dataset</div>
+                  <div className="text-xs text-muted-foreground">
+                    El panel izquierdo carga las columnas reales desde D1.
+                  </div>
+                </div>
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="font-medium text-xs mb-1">2. Elegí el gráfico</div>
+                  <div className="text-xs text-muted-foreground">
+                    Barra, línea, scatter o pie. Si no sabés cuál usar, tocá “Sugerir configuración”.
+                  </div>
+                </div>
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="font-medium text-xs mb-1">3. Ajustá columnas</div>
+                  <div className="text-xs text-muted-foreground">
+                    X define el grupo, Y define la métrica y la agregación cambia el cálculo.
+                  </div>
+                </div>
+                <div className="rounded-xl bg-muted/30 p-3">
+                  <div className="font-medium text-xs mb-1">4. Pasá a entrenar</div>
+                  <div className="text-xs text-muted-foreground">
+                    Cuando tengas una buena vista, usá Model Lab para entrenar con target y parámetros.
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      ) : null}
+
+      <button
+        onClick={() => setHelpOpen((v) => !v)}
+        className="fixed bottom-6 right-6 z-40 h-14 w-14 rounded-full shadow-xl bg-primary text-primary-foreground flex items-center justify-center hover:scale-105 transition-transform"
+        aria-label="Abrir ayuda"
+      >
+        <CircleHelp className="h-6 w-6" />
+      </button>
     </div>
   );
 }
