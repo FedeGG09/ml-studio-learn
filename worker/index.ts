@@ -143,19 +143,47 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-async function initDb(db: D1Database) {
-  if (!initPromise) {
-    initPromise = db.exec(INIT_SQL).then(() => undefined);
-  }
-  await initPromise;
-}
-
 async function parseJson(request: Request) {
   try {
     return await request.json();
   } catch {
     return null;
   }
+}
+
+async function columnExists(db: D1Database, table: string, column: string) {
+  const res = await db.prepare(`PRAGMA table_info("${table}")`).all<any>();
+  const rows = (res.results ?? []) as Array<{ name?: string }>;
+  return rows.some((r) => r.name === column);
+}
+
+async function ensureColumn(
+  db: D1Database,
+  table: string,
+  column: string,
+  definition: string
+) {
+  const exists = await columnExists(db, table, column);
+  if (!exists) {
+    await db.exec(`ALTER TABLE "${table}" ADD COLUMN ${column} ${definition};`);
+  }
+}
+
+async function ensureSchema(db: D1Database) {
+  await db.exec(INIT_SQL);
+
+  // Compatibilidad con versiones anteriores del Worker.
+  await ensureColumn(db, "experiments", "task_type", "TEXT");
+  await ensureColumn(db, "experiments", "train_split", "INTEGER");
+  await ensureColumn(db, "experiments", "results_json", "TEXT");
+  await ensureColumn(db, "experiments", "hyperparams_json", "TEXT");
+}
+
+async function initDb(db: D1Database) {
+  if (!initPromise) {
+    initPromise = ensureSchema(db).then(() => undefined);
+  }
+  await initPromise;
 }
 
 function sanitizeIdentifier(input: string): string {
@@ -300,22 +328,21 @@ function resolveDatasetTableName(dataset: any): string {
   if (Number(dataset.id) === 1) return "retail_sales";
   if (Number(dataset.id) === 2) return "saas_churn";
 
-  const storageKey = typeof dataset.storage_key === "string" ? dataset.storage_key.trim() : "";
+  const storageKey =
+    typeof dataset.storage_key === "string" ? dataset.storage_key.trim() : "";
   if (storageKey && /^[A-Za-z_][A-Za-z0-9_]*$/.test(storageKey)) return storageKey;
 
   return `dataset_${dataset.id}`;
 }
 
 async function fetchRows(db: D1Database, sql: string, params: any[] = []) {
-  let stmt = db.prepare(sql);
-  for (const param of params) stmt = stmt.bind(param);
+  const stmt = params.length ? db.prepare(sql).bind(...params) : db.prepare(sql);
   const { results } = await stmt.all();
   return results ?? [];
 }
 
 async function fetchSingle(db: D1Database, sql: string, params: any[] = []) {
-  let stmt = db.prepare(sql);
-  for (const param of params) stmt = stmt.bind(param);
+  const stmt = params.length ? db.prepare(sql).bind(...params) : db.prepare(sql);
   return stmt.first<any>();
 }
 
@@ -341,14 +368,27 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
   const targetMeta = columns.find((c: any) => Number(c.is_target) === 1) ?? null;
   const targetColumn = targetMeta?.column_name ?? dataset.target_column ?? null;
 
+  const targetType = targetMeta?.data_type ? String(targetMeta.data_type).toUpperCase() : "";
+  const targetUniqueCount = Number(targetMeta?.unique_count ?? 0);
+
   let stats: Record<string, unknown> = {
     total_rows: Number(dataset.row_count) || preview.length || 0,
   };
 
   if (safeTable && targetColumn) {
-    const isNumericTarget = targetMeta && ["INTEGER", "REAL"].includes(String(targetMeta.data_type).toUpperCase());
-
-    if (isNumericTarget && Number(targetMeta?.unique_count ?? 0) <= 2) {
+    if (targetType === "TEXT") {
+      const row = await fetchSingle(
+        db,
+        `SELECT
+           COUNT(*) AS total_rows,
+           COUNT(DISTINCT "${targetColumn}") AS class_count
+         FROM "${safeTable}"`
+      );
+      stats = {
+        total_rows: Number(row?.total_rows ?? 0),
+        class_count: Number(row?.class_count ?? 0),
+      };
+    } else if (["INTEGER", "REAL"].includes(targetType) && targetUniqueCount <= 2) {
       const row = await fetchSingle(
         db,
         `SELECT
@@ -360,7 +400,7 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
         total_rows: Number(row?.total_rows ?? 0),
         target_positive_rate_pct: Number(row?.target_positive_rate_pct ?? 0),
       };
-    } else if (isNumericTarget) {
+    } else if (["INTEGER", "REAL"].includes(targetType)) {
       const row = await fetchSingle(
         db,
         `SELECT
@@ -376,12 +416,11 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
   }
 
   const inferredProblemType =
-    targetMeta
-      ? (["INTEGER", "REAL"].includes(String(targetMeta.data_type).toUpperCase()) &&
-        Number(targetMeta.unique_count ?? 0) <= 2
-          ? "classification"
-          : "regression")
-      : "classification";
+    targetType === "TEXT"
+      ? "classification"
+      : ["INTEGER", "REAL"].includes(targetType) && targetUniqueCount <= 2
+        ? "classification"
+        : "regression";
 
   return {
     ok: true,
@@ -503,10 +542,14 @@ async function listExperiments(db: D1Database, datasetId?: number) {
       dataset_id: exp.dataset_id,
       experiment_name: exp.experiment_name,
       problem_type: exp.problem_type,
+      task_type: exp.task_type ?? exp.problem_type ?? null,
       target_column: exp.target_column,
       train_size: exp.train_size,
       test_size: exp.test_size,
+      train_split: exp.train_split ?? null,
       random_state: exp.random_state,
+      results_json: exp.results_json ?? null,
+      hyperparams_json: exp.hyperparams_json ?? null,
       created_at: exp.created_at,
       run_count: details.runs.length,
       failed_runs: details.runs.filter((r: any) => r.status === "failed").length,
@@ -527,7 +570,14 @@ function buildRunResult(
   targetColumn: string,
   trainSplit: number
 ): BenchRun {
-  const seed = stableNoise(datasetId, taskType, modelName, targetColumn, trainSplit, JSON.stringify(params));
+  const seed = stableNoise(
+    datasetId,
+    taskType,
+    modelName,
+    targetColumn,
+    trainSplit,
+    JSON.stringify(params)
+  );
   const failSeed = stableNoise("fail", datasetId, taskType, modelName, targetColumn);
   const failureChance = 0.14 + (modelName === "SVM" ? 0.04 : 0) + (modelName === "KNN" ? 0.02 : 0);
   const success = failSeed > failureChance;
@@ -609,8 +659,12 @@ async function persistBenchmark(
         target_column,
         train_size,
         test_size,
-        random_state
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        random_state,
+        task_type,
+        train_split,
+        results_json,
+        hyperparams_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       input.datasetId,
@@ -619,7 +673,11 @@ async function persistBenchmark(
       input.targetColumn,
       input.trainSplit / 100,
       (100 - input.trainSplit) / 100,
-      input.randomState
+      input.randomState,
+      input.taskType,
+      input.trainSplit,
+      null,
+      JSON.stringify(input.paramsByModel ?? {})
     )
     .run();
 
@@ -688,12 +746,13 @@ async function persistBenchmark(
       .bind(runId, "run_summary", `experiments/${experimentId}/runs/${runId}.json`)
       .run();
 
-    results.push(run);
+    results.push({
+      ...run,
+      params,
+    });
   }
 
-  const ranking = [...results].sort(
-    (a, b) => Number(b.score ?? -999) - Number(a.score ?? -999)
-  );
+  const ranking = [...results].sort((a, b) => Number(b.score ?? -999) - Number(a.score ?? -999));
 
   if (firstRunId) {
     await db
@@ -705,8 +764,25 @@ async function persistBenchmark(
       .run();
   }
 
+  await db
+    .prepare(
+      `UPDATE experiments
+       SET results_json = ?, hyperparams_json = ?
+       WHERE id = ?`
+    )
+    .bind(
+      JSON.stringify({
+        ranking,
+        runs: results,
+      }),
+      JSON.stringify(input.paramsByModel ?? {}),
+      experimentId
+    )
+    .run();
+
   return { experimentId, results, ranking };
 }
+
 async function importCsvDataset(db: D1Database, request: Request) {
   const form = await request.formData();
 
@@ -725,23 +801,18 @@ async function importCsvDataset(db: D1Database, request: Request) {
         : null;
 
   if (!rawText) {
-    return json(
-      { ok: false, error: "CSV file or csvText is required" },
-      400
-    );
+    return json({ ok: false, error: "CSV file or csvText is required" }, 400);
   }
 
   const parsed = parseCsv(rawText.replace(/^\uFEFF/, ""));
   if (parsed.length < 2) {
-    return json(
-      { ok: false, error: "CSV must contain header and at least one row" },
-      400
-    );
+    return json({ ok: false, error: "CSV must contain header and at least one row" }, 400);
   }
 
-  const headers = uniqueNames(
-    parsed[0].map((h) => sanitizeIdentifier(h || "column"))
-  );
+  const headers = uniqueNames(parsed[0].map((h) => sanitizeIdentifier(h || "column")));
+  if (headers.length === 0) {
+    return json({ ok: false, error: "CSV header is empty" }, 400);
+  }
 
   const dataRows = parsed
     .slice(1)
@@ -822,15 +893,16 @@ async function importCsvDataset(db: D1Database, request: Request) {
     .map((header, i) => `"${header}" ${inferredTypes[i]}`)
     .join(", ");
 
-  await db.exec(`CREATE TABLE IF NOT EXISTS "${tableName}" (${columnDefs});`);
+  await db.exec(`DROP TABLE IF EXISTS "${tableName}";`);
+  await db.exec(`CREATE TABLE "${tableName}" (${columnDefs});`);
 
   const insertSql = `INSERT INTO "${tableName}" (${headers
     .map((h) => `"${h}"`)
     .join(", ")}) VALUES (${headers.map(() => "?").join(", ")})`;
 
-  const statements = dataRows.map((rawRow) => {
+  const statements: D1PreparedStatement[] = [];
+  for (const rawRow of dataRows) {
     const row = [...rawRow];
-
     while (row.length < headers.length) row.push("");
     if (row.length > headers.length) row.length = headers.length;
 
@@ -838,8 +910,8 @@ async function importCsvDataset(db: D1Database, request: Request) {
       coerceValue(row[colIndex] ?? "", inferredTypes[colIndex])
     );
 
-    return db.prepare(insertSql).bind(...values);
-  });
+    statements.push(db.prepare(insertSql).bind(...values));
+  }
 
   for (let i = 0; i < statements.length; i += 50) {
     await db.batch(statements.slice(i, i + 50));
@@ -927,6 +999,7 @@ async function importCsvDataset(db: D1Database, request: Request) {
     },
   });
 }
+
 async function executeSql(db: D1Database, body: any) {
   const query = String(body?.query ?? "").trim();
   if (!query) {
@@ -934,6 +1007,16 @@ async function executeSql(db: D1Database, body: any) {
   }
 
   const keyword = query.split(/\s+/)[0].toUpperCase();
+  if (!["SELECT", "WITH", "PRAGMA", "EXPLAIN"].includes(keyword)) {
+    return json(
+      {
+        ok: false,
+        error: "Only read-only SQL is allowed in SQL Lab",
+      },
+      400
+    );
+  }
+
   const datasetId = body?.datasetId ? Number(body.datasetId) : null;
   const queryName =
     typeof body?.queryName === "string" && body.queryName.trim()
@@ -941,17 +1024,9 @@ async function executeSql(db: D1Database, body: any) {
       : query.slice(0, 80);
 
   try {
-    let results: unknown[] = [];
-    let meta: unknown = null;
-
-    if (["SELECT", "WITH", "PRAGMA", "EXPLAIN"].includes(keyword)) {
-      const res = await db.prepare(query).all();
-      results = res.results ?? [];
-      meta = res.meta ?? null;
-    } else {
-      const res = await db.prepare(query).run();
-      meta = res.meta ?? null;
-    }
+    const res = await db.prepare(query).all();
+    const results = res.results ?? [];
+    const meta = res.meta ?? null;
 
     await db
       .prepare(
@@ -984,24 +1059,26 @@ async function handleBenchmark(db: D1Database, body: any, single = false) {
     return json({ ok: false, error: "Dataset not found" }, 404);
   }
 
-  const taskType = (body?.taskType ?? "classification") as TaskType;
-  const targetColumn =
-    body?.targetColumn || dataset.target_column || "target";
+  const taskType = (body?.taskType ?? dataset?.inferred_problem_type ?? "classification") as TaskType;
+  const targetColumn = body?.targetColumn || dataset.target_column || "target";
 
-  const selectedModels = single
-    ? [body.modelName]
-    : body.models?.length
-      ? body.models
-      : getDefaultModels(taskType);
+  const selectedModels =
+    single
+      ? [String(body?.modelName ?? "")].filter(Boolean)
+      : Array.isArray(body?.models) && body.models.length > 0
+        ? body.models.map(String)
+        : getDefaultModels(taskType);
+
+  if (selectedModels.length === 0) {
+    return json({ ok: false, error: "No models selected" }, 400);
+  }
 
   const result = await persistBenchmark(db, {
     datasetId,
     taskType,
     targetColumn,
     trainSplit: Number(body?.trainSplit ?? 80),
-    experimentName:
-      body?.experimentName ||
-      `Benchmark ${dataset.name}`,
+    experimentName: body?.experimentName || `Benchmark ${dataset.name}`,
     selectedModels,
     randomState: Number(body?.randomState ?? 42),
     paramsByModel: body?.paramsByModel ?? {},
@@ -1025,163 +1102,174 @@ async function getModelSpecPayload() {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    await initDb(env.DB);
+    try {
+      await initDb(env.DB);
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
-    }
-
-    const url = new URL(request.url);
-    const { pathname, searchParams } = url;
-
-    if (pathname === "/api/health") {
-      return json({ ok: true, service: "ml-studio-api" });
-    }
-
-    if (pathname === "/api/models" && request.method === "GET") {
-      return json(await getModelSpecPayload());
-    }
-
-    if (pathname === "/api/datasets" && request.method === "GET") {
-      const datasets = await fetchRows(env.DB, "SELECT * FROM datasets ORDER BY id ASC");
-      const enriched = await Promise.all(
-        (datasets as any[]).map(async (dataset) => {
-          const profile = await getDatasetProfile(env.DB, Number(dataset.id));
-          return profile?.dataset ?? dataset;
-        })
-      );
-
-      return json({ ok: true, datasets: enriched });
-    }
-
-    if (pathname === "/api/datasets" && request.method === "POST") {
-      const body = await parseJson(request);
-      if (!body?.name || !body?.source_type) {
-        return json({ ok: false, error: "name and source_type are required" }, 400);
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders() });
       }
 
-      const result = await env.DB.prepare(
-        `INSERT INTO datasets (
-          name, description, source_type, storage_key, preview_key, row_count, column_count, target_column
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(
-          body.name,
-          body.description ?? null,
-          body.source_type,
-          body.storage_key ?? null,
-          body.preview_key ?? null,
-          body.row_count ?? null,
-          body.column_count ?? null,
-          body.target_column ?? null
+      const url = new URL(request.url);
+      const { pathname, searchParams } = url;
+
+      if (pathname === "/api/health") {
+        return json({ ok: true, service: "ml-studio-api" });
+      }
+
+      if (pathname === "/api/models" && request.method === "GET") {
+        return json(await getModelSpecPayload());
+      }
+
+      if (pathname === "/api/datasets" && request.method === "GET") {
+        const datasets = await fetchRows(env.DB, "SELECT * FROM datasets ORDER BY id ASC");
+        const enriched = await Promise.all(
+          (datasets as any[]).map(async (dataset) => {
+            const profile = await getDatasetProfile(env.DB, Number(dataset.id));
+            return profile?.dataset ?? dataset;
+          })
+        );
+
+        return json({ ok: true, datasets: enriched });
+      }
+
+      if (pathname === "/api/datasets" && request.method === "POST") {
+        const body = await parseJson(request);
+        if (!body?.name || !body?.source_type) {
+          return json({ ok: false, error: "name and source_type are required" }, 400);
+        }
+
+        const result = await env.DB.prepare(
+          `INSERT INTO datasets (
+            name, description, source_type, storage_key, preview_key, row_count, column_count, target_column
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
         )
-        .run();
-
-      return json({ ok: true, dataset_id: result.meta.last_row_id }, 201);
-    }
-
-    if (pathname === "/api/datasets/import" && request.method === "POST") {
-      return importCsvDataset(env.DB, request);
-    }
-
-    const profileMatch = pathname.match(/^\/api\/datasets\/(\d+)\/profile$/);
-    const datasetMatch = pathname.match(/^\/api\/datasets\/(\d+)$/);
-
-    if ((profileMatch || datasetMatch) && request.method === "GET") {
-      const id = Number(profileMatch?.[1] ?? datasetMatch?.[1]);
-      const profile = await getDatasetProfile(env.DB, id);
-
-      if (!profile) {
-        return json({ ok: false, error: "Dataset not found" }, 404);
-      }
-
-      return json(profile);
-    }
-
-    const datasetExperimentsMatch = pathname.match(/^\/api\/datasets\/(\d+)\/experiments$/);
-    if (datasetExperimentsMatch && request.method === "GET") {
-      const datasetId = Number(datasetExperimentsMatch[1]);
-      const experiments = await listExperiments(env.DB, datasetId);
-      return json({ ok: true, experiments });
-    }
-
-    if (pathname === "/api/sql/execute" && request.method === "POST") {
-      const body = await parseJson(request);
-      return executeSql(env.DB, body);
-    }
-
-    if (pathname === "/api/sql/history" && request.method === "GET") {
-      const datasetId = searchParams.get("datasetId");
-      const queries = datasetId
-        ? await fetchRows(
-            env.DB,
-            "SELECT * FROM sql_queries WHERE dataset_id = ? ORDER BY id DESC",
-            [Number(datasetId)]
+          .bind(
+            body.name,
+            body.description ?? null,
+            body.source_type,
+            body.storage_key ?? null,
+            body.preview_key ?? null,
+            body.row_count ?? null,
+            body.column_count ?? null,
+            body.target_column ?? null
           )
-        : await fetchRows(env.DB, "SELECT * FROM sql_queries ORDER BY id DESC");
+          .run();
 
-      return json({ ok: true, queries });
-    }
-
-    if (pathname === "/api/experiments" && request.method === "GET") {
-      const datasetIdParam = searchParams.get("datasetId");
-      const experiments = await listExperiments(
-        env.DB,
-        datasetIdParam ? Number(datasetIdParam) : undefined
-      );
-
-      return json({ ok: true, experiments });
-    }
-
-    const experimentMatch = pathname.match(/^\/api\/experiments\/(\d+)$/);
-    if (experimentMatch && request.method === "GET") {
-      const experimentId = Number(experimentMatch[1]);
-      const details = await getExperimentDetails(env.DB, experimentId);
-
-      if (!details) {
-        return json({ ok: false, error: "Experiment not found" }, 404);
+        return json({ ok: true, dataset_id: result.meta.last_row_id }, 201);
       }
 
-      return json({ ok: true, ...details });
-    }
-
-    if (pathname === "/api/train" && request.method === "POST") {
-      const body = await parseJson(request);
-      if (!body?.datasetId || !body?.modelName) {
-        return json({ ok: false, error: "datasetId and modelName are required" }, 400);
+      if (pathname === "/api/datasets/import" && request.method === "POST") {
+        return importCsvDataset(env.DB, request);
       }
 
-      const dataset = await getDatasetById(env.DB, Number(body.datasetId));
-      const taskType = (body?.taskType ?? dataset?.inferred_problem_type ?? "classification") as TaskType;
+      const profileMatch = pathname.match(/^\/api\/datasets\/(\d+)\/profile$/);
+      const datasetMatch = pathname.match(/^\/api\/datasets\/(\d+)$/);
 
-      return handleBenchmark(
-        env.DB,
+      if ((profileMatch || datasetMatch) && request.method === "GET") {
+        const id = Number(profileMatch?.[1] ?? datasetMatch?.[1]);
+        const profile = await getDatasetProfile(env.DB, id);
+
+        if (!profile) {
+          return json({ ok: false, error: "Dataset not found" }, 404);
+        }
+
+        return json(profile);
+      }
+
+      const datasetExperimentsMatch = pathname.match(/^\/api\/datasets\/(\d+)\/experiments$/);
+      if (datasetExperimentsMatch && request.method === "GET") {
+        const datasetId = Number(datasetExperimentsMatch[1]);
+        const experiments = await listExperiments(env.DB, datasetId);
+        return json({ ok: true, experiments });
+      }
+
+      if (pathname === "/api/sql/execute" && request.method === "POST") {
+        const body = await parseJson(request);
+        return executeSql(env.DB, body);
+      }
+
+      if (pathname === "/api/sql/history" && request.method === "GET") {
+        const datasetId = searchParams.get("datasetId");
+        const queries = datasetId
+          ? await fetchRows(
+              env.DB,
+              "SELECT * FROM sql_queries WHERE dataset_id = ? ORDER BY id DESC",
+              [Number(datasetId)]
+            )
+          : await fetchRows(env.DB, "SELECT * FROM sql_queries ORDER BY id DESC");
+
+        return json({ ok: true, queries });
+      }
+
+      if (pathname === "/api/experiments" && request.method === "GET") {
+        const datasetIdParam = searchParams.get("datasetId");
+        const experiments = await listExperiments(
+          env.DB,
+          datasetIdParam ? Number(datasetIdParam) : undefined
+        );
+
+        return json({ ok: true, experiments });
+      }
+
+      const experimentMatch = pathname.match(/^\/api\/experiments\/(\d+)$/);
+      if (experimentMatch && request.method === "GET") {
+        const experimentId = Number(experimentMatch[1]);
+        const details = await getExperimentDetails(env.DB, experimentId);
+
+        if (!details) {
+          return json({ ok: false, error: "Experiment not found" }, 404);
+        }
+
+        return json({ ok: true, ...details });
+      }
+
+      if (pathname === "/api/train" && request.method === "POST") {
+        const body = await parseJson(request);
+        if (!body?.datasetId || !body?.modelName) {
+          return json({ ok: false, error: "datasetId and modelName are required" }, 400);
+        }
+
+        const dataset = await getDatasetById(env.DB, Number(body.datasetId));
+        const taskType = (body?.taskType ?? dataset?.inferred_problem_type ?? "classification") as TaskType;
+
+        return handleBenchmark(
+          env.DB,
+          {
+            ...body,
+            taskType,
+            modelName: body.modelName,
+            models: [body.modelName],
+          },
+          true
+        );
+      }
+
+      if (pathname === "/api/train-all" && request.method === "POST") {
+        const body = await parseJson(request);
+        return handleBenchmark(env.DB, body, false);
+      }
+
+      if (pathname.startsWith("/api/")) {
+        return json({ ok: false, error: "Not found" }, 404);
+      }
+
+      const assetResponse = await env.ASSETS.fetch(request);
+      if (assetResponse.status !== 404) {
+        return assetResponse;
+      }
+
+      const spaUrl = new URL(request.url);
+      spaUrl.pathname = "/";
+      return env.ASSETS.fetch(new Request(spaUrl.toString(), request));
+    } catch (error: any) {
+      console.error("Worker error:", error);
+      return json(
         {
-          ...body,
-          taskType,
-          modelName: body.modelName,
-          models: [body.modelName],
+          ok: false,
+          error: error?.message ?? "Internal server error",
         },
-        true
+        500
       );
     }
-
-    if (pathname === "/api/train-all" && request.method === "POST") {
-      const body = await parseJson(request);
-      return handleBenchmark(env.DB, body, false);
-    }
-
-    const assetResponse = await env.ASSETS.fetch(request);
-    if (assetResponse.status !== 404) {
-      return assetResponse;
-    }
-
-    if (pathname.startsWith("/api/") || pathname.includes(".")) {
-      return assetResponse;
-    }
-
-    const spaUrl = new URL(request.url);
-    spaUrl.pathname = "/";
-    return env.ASSETS.fetch(new Request(spaUrl.toString(), request));
   },
 };
