@@ -21,9 +21,78 @@ type TrainResult = {
   metrics?: Record<string, number> | null;
 };
 
+type ModelDoc = {
+  name: string;
+  technical: string;
+  simple: string;
+};
+
 const fallbackModels: Record<TaskType, string[]> = {
   regression: ["Linear Regression", "Ridge", "Lasso", "SVR", "Decision Tree"],
   classification: ["Logistic Regression", "KNN", "SVM", "Naive Bayes", "Random Forest", "XGBoost", "AdaBoost"],
+};
+
+const modelDocs: Record<string, ModelDoc> = {
+  "Linear Regression": {
+    name: "Linear Regression",
+    technical: "Ajusta una relación lineal entre variables de entrada y una salida continua minimizando el error cuadrático.",
+    simple: "Traza una línea para predecir un número.",
+  },
+  Ridge: {
+    name: "Ridge",
+    technical: "Regresión lineal con regularización L2 para reducir coeficientes grandes y mejorar estabilidad.",
+    simple: "Es como Linear Regression, pero más estable.",
+  },
+  Lasso: {
+    name: "Lasso",
+    technical: "Regresión lineal con regularización L1, útil para selección de variables y sparsity.",
+    simple: "Puede apagar variables que no aportan.",
+  },
+  SVR: {
+    name: "SVR",
+    technical: "Support Vector Regression busca una función robusta dentro de un margen de tolerancia.",
+    simple: "Intenta predecir números sin reaccionar de más al ruido.",
+  },
+  "Decision Tree": {
+    name: "Decision Tree",
+    technical: "Divide el espacio de variables en reglas jerárquicas para modelar relaciones no lineales.",
+    simple: "Hace preguntas una por una hasta llegar a una decisión.",
+  },
+  "Logistic Regression": {
+    name: "Logistic Regression",
+    technical: "Modelo lineal para clasificación que estima probabilidades mediante una función logística.",
+    simple: "Predice si algo pertenece o no a una clase.",
+  },
+  KNN: {
+    name: "KNN",
+    technical: "Clasifica usando la cercanía de los ejemplos vecinos en el espacio de características.",
+    simple: "Mira a los más parecidos y vota.",
+  },
+  SVM: {
+    name: "SVM",
+    technical: "Encuentra un hiperplano de máximo margen para separar clases.",
+    simple: "Traza una frontera que deje a los grupos mejor separados.",
+  },
+  "Naive Bayes": {
+    name: "Naive Bayes",
+    technical: "Clasificador probabilístico basado en la regla de Bayes con independencia condicional asumida.",
+    simple: "Calcula probabilidades para cada clase.",
+  },
+  "Random Forest": {
+    name: "Random Forest",
+    technical: "Ensamble de árboles entrenados sobre subconjuntos de datos y variables para reducir varianza.",
+    simple: "Muchos árboles votan juntos.",
+  },
+  XGBoost: {
+    name: "XGBoost",
+    technical: "Gradient boosting optimizado que construye árboles secuenciales corrigiendo errores previos.",
+    simple: "Va mejorando paso a paso con árboles.",
+  },
+  AdaBoost: {
+    name: "AdaBoost",
+    technical: "Ensamble boosting que repondera ejemplos difíciles y combina estimadores débiles.",
+    simple: "Se enfoca más en los casos difíciles.",
+  },
 };
 
 const hyperparamsMap: Record<
@@ -45,9 +114,7 @@ const hyperparamsMap: Record<
     { label: "C", min: 0.01, max: 100, step: 0.01, default: 1, explanation: "Regularización del modelo." },
     { label: "max_iter", min: 100, max: 5000, step: 100, default: 1000, explanation: "Iteraciones máximas." },
   ],
-  KNN: [
-    { label: "n_neighbors", min: 1, max: 50, step: 1, default: 5, explanation: "Cantidad de vecinos." },
-  ],
+  KNN: [{ label: "n_neighbors", min: 1, max: 50, step: 1, default: 5, explanation: "Cantidad de vecinos." }],
   SVM: [
     { label: "C", min: 0.1, max: 100, step: 0.1, default: 1, explanation: "Penalización por errores." },
     { label: "kernel", min: 0, max: 2, step: 1, default: 0, explanation: "0=linear, 1=rbf, 2=poly" },
@@ -71,15 +138,16 @@ const hyperparamsMap: Record<
 export default function ModelLab() {
   const location = useLocation();
   const queryClient = useQueryClient();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const locationState = (location.state ?? {}) as any;
   const datasetId = Number(searchParams.get("datasetId") ?? locationState.datasetId ?? 1);
   const targetFromUrl = searchParams.get("target") ?? locationState.target ?? "";
   const problemTypeFromUrl = searchParams.get("problemType") as TaskType | null;
+  const modelFromUrl = searchParams.get("model") ?? "";
 
   const [taskType, setTaskType] = useState<TaskType>(problemTypeFromUrl ?? "classification");
-  const [selectedModel, setSelectedModel] = useState<string>("Random Forest");
+  const [selectedModel, setSelectedModel] = useState<string>(modelFromUrl || "Random Forest");
   const [trainSplit, setTrainSplit] = useState([80]);
   const [params, setParams] = useState<Record<string, number>>({});
   const [singleResult, setSingleResult] = useState<TrainResult | null>(null);
@@ -124,10 +192,17 @@ export default function ModelLab() {
   }, [problemTypeFromUrl, datasetQuery.data]);
 
   useEffect(() => {
+    if (modelFromUrl && availableModels.includes(modelFromUrl)) {
+      setSelectedModel(modelFromUrl);
+      setParams({});
+      return;
+    }
+
     if (!availableModels.includes(selectedModel)) {
       setSelectedModel(availableModels[0] ?? "");
+      setParams({});
     }
-  }, [availableModels, selectedModel]);
+  }, [availableModels, modelFromUrl, selectedModel]);
 
   const datasetName =
     (datasetQuery.data as any)?.dataset?.name ??
@@ -141,6 +216,11 @@ export default function ModelLab() {
     "";
 
   const currentHyperparams = hyperparamsMap[selectedModel] ?? [];
+  const selectedDoc = modelDocs[selectedModel] ?? {
+    name: selectedModel,
+    technical: "No hay explicación cargada para este modelo.",
+    simple: "Seleccioná otro modelo o completá el diccionario de descripciones.",
+  };
 
   const getParam = (label: string, def: number) => params[label] ?? def;
 
@@ -268,6 +348,12 @@ export default function ModelLab() {
                       setSelectedModel(fallbackModels[t][0] ?? "");
                       setParams({});
                       setSingleResult(null);
+                      setSearchParams((prev) => {
+                        const next = new URLSearchParams(prev);
+                        next.set("problemType", t);
+                        next.delete("model");
+                        return next;
+                      });
                     }}
                     className={`flex-1 py-2 rounded-lg text-xs font-medium transition-all ${
                       taskType === t
@@ -295,6 +381,11 @@ export default function ModelLab() {
                       setSelectedModel(m);
                       setParams({});
                       setSingleResult(null);
+                      setSearchParams((prev) => {
+                        const next = new URLSearchParams(prev);
+                        next.set("model", m);
+                        return next;
+                      });
                     }}
                     className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-all ${
                       selectedModel === m
@@ -361,10 +452,20 @@ export default function ModelLab() {
             <CardHeader>
               <CardTitle className="text-sm flex items-center gap-2">
                 <Brain className="h-5 w-5 text-primary" />
-                {selectedModel}
+                {selectedDoc.name}
               </CardTitle>
             </CardHeader>
-            <CardContent className="space-y-6">
+            <CardContent className="space-y-5">
+              <div className="rounded-2xl border border-border/60 p-4">
+                <div className="text-xs text-muted-foreground mb-1">Técnico: ¿Qué hace?</div>
+                <p className="text-sm">{selectedDoc.technical}</p>
+              </div>
+
+              <div className="rounded-2xl border border-border/60 p-4">
+                <div className="text-xs text-muted-foreground mb-1">Sencillo: ¿Cómo funciona?</div>
+                <p className="text-sm">{selectedDoc.simple}</p>
+              </div>
+
               {currentHyperparams.length === 0 ? (
                 <p className="text-sm text-muted-foreground">
                   Este modelo no tiene hiperparámetros ajustables.
@@ -374,18 +475,14 @@ export default function ModelLab() {
                   {currentHyperparams.map((hp) => (
                     <div key={hp.label}>
                       <div className="flex items-center justify-between mb-2">
-                        <label className="text-sm font-mono font-medium">
-                          {hp.label}
-                        </label>
+                        <label className="text-sm font-mono font-medium">{hp.label}</label>
                         <span className="text-sm font-mono text-primary font-bold">
                           {getParam(hp.label, hp.default)}
                         </span>
                       </div>
                       <Slider
                         value={[getParam(hp.label, hp.default)]}
-                        onValueChange={([v]) =>
-                          setParams({ ...params, [hp.label]: v })
-                        }
+                        onValueChange={([v]) => setParams({ ...params, [hp.label]: v })}
                         min={hp.min}
                         max={hp.max}
                         step={hp.step}
@@ -393,9 +490,7 @@ export default function ModelLab() {
                       />
                       <div className="flex items-start gap-1.5 mt-2">
                         <Info className="h-3 w-3 text-muted-foreground mt-0.5 shrink-0" />
-                        <p className="text-xs text-muted-foreground">
-                          {hp.explanation}
-                        </p>
+                        <p className="text-xs text-muted-foreground">{hp.explanation}</p>
                       </div>
                     </div>
                   ))}
@@ -433,13 +528,9 @@ export default function ModelLab() {
               <CardContent className="space-y-2 text-sm">
                 <div>Modelo: {singleResult.model}</div>
                 <div>Estado: {singleResult.success ? "Done" : "Failed"}</div>
-                <div>
-                  Score: {singleResult.score !== null ? singleResult.score : "—"}
-                </div>
+                <div>Score: {singleResult.score !== null ? singleResult.score : "—"}</div>
                 <div>Duración: {singleResult.duration_ms} ms</div>
-                {singleResult.error && (
-                  <div className="text-red-500">{singleResult.error}</div>
-                )}
+                {singleResult.error && <div className="text-red-500">{singleResult.error}</div>}
               </CardContent>
             </Card>
           )}
