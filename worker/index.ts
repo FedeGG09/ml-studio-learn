@@ -617,19 +617,21 @@ async function persistBenchmark(
       input.experimentName,
       input.taskType,
       input.targetColumn,
-      Number((input.trainSplit / 100).toFixed(2)),
-      Number(((100 - input.trainSplit) / 100).toFixed(2)),
+      input.trainSplit / 100,
+      (100 - input.trainSplit) / 100,
       input.randomState
     )
     .run();
 
   const experimentId = Number(experimentInsert.meta.last_row_id);
   const results: BenchRun[] = [];
+  let firstRunId: number | null = null;
 
   for (const modelName of input.selectedModels) {
-    const defaults = getDefaultParams(modelName);
-    const userParams = input.paramsByModel?.[modelName] ?? {};
-    const params = { ...defaults, ...userParams };
+    const params = {
+      ...getDefaultParams(modelName),
+      ...(input.paramsByModel?.[modelName] ?? {}),
+    };
 
     const run = buildRunResult(
       input.datasetId,
@@ -662,13 +664,14 @@ async function persistBenchmark(
       .run();
 
     const runId = Number(runInsert.meta.last_row_id);
+    if (!firstRunId) firstRunId = runId;
 
     await db
       .prepare(`INSERT INTO model_configs (run_id, params_json) VALUES (?, ?)`)
       .bind(runId, JSON.stringify(params))
       .run();
 
-    if (run.success && run.metrics) {
+    if (run.metrics) {
       for (const [metricName, metricValue] of Object.entries(run.metrics)) {
         await db
           .prepare(`INSERT INTO metrics (run_id, metric_name, metric_value) VALUES (?, ?, ?)`)
@@ -679,37 +682,31 @@ async function persistBenchmark(
 
     await db
       .prepare(
-        `INSERT INTO artifacts (run_id, artifact_type, artifact_key, created_at)
-         VALUES (?, ?, ?, datetime('now'))`
+        `INSERT INTO artifacts (run_id, artifact_type, artifact_key)
+         VALUES (?, ?, ?)`
       )
       .bind(runId, "run_summary", `experiments/${experimentId}/runs/${runId}.json`)
       .run();
 
-    results.push({ ...run, params });
+    results.push(run);
   }
 
-  const ranking = [...results].sort((a, b) => {
-    const aOk = a.success && a.score !== null;
-    const bOk = b.success && b.score !== null;
-    if (aOk !== bOk) return aOk ? -1 : 1;
-    return Number(b.score ?? -Infinity) - Number(a.score ?? -Infinity);
-  });
+  const ranking = [...results].sort(
+    (a, b) => Number(b.score ?? -999) - Number(a.score ?? -999)
+  );
 
-  await db
-    .prepare(
-      `INSERT INTO artifacts (run_id, artifact_type, artifact_key, created_at)
-       VALUES (?, ?, ?, datetime('now'))`
-    )
-    .bind(experimentId, "leaderboard", `experiments/${experimentId}/leaderboard.json`)
-    .run();
+  if (firstRunId) {
+    await db
+      .prepare(
+        `INSERT INTO artifacts (run_id, artifact_type, artifact_key)
+         VALUES (?, ?, ?)`
+      )
+      .bind(firstRunId, "leaderboard", `experiments/${experimentId}/leaderboard.json`)
+      .run();
+  }
 
-  return {
-    experimentId,
-    results,
-    ranking,
-  };
+  return { experimentId, results, ranking };
 }
-
 async function importCsvDataset(db: D1Database, request: Request) {
   const form = await request.formData();
 
@@ -728,16 +725,28 @@ async function importCsvDataset(db: D1Database, request: Request) {
         : null;
 
   if (!rawText) {
-    return json({ ok: false, error: "CSV file or csvText is required" }, 400);
+    return json(
+      { ok: false, error: "CSV file or csvText is required" },
+      400
+    );
   }
 
-  const parsed = parseCsv(rawText);
+  const parsed = parseCsv(rawText.replace(/^\uFEFF/, ""));
   if (parsed.length < 2) {
-    return json({ ok: false, error: "CSV must contain header and at least one row" }, 400);
+    return json(
+      { ok: false, error: "CSV must contain header and at least one row" },
+      400
+    );
   }
 
-  const headers = uniqueNames(parsed[0].map((h) => sanitizeIdentifier(h || "column")));
-  const dataRows = parsed.slice(1).filter((row) => row.some((cell) => cell.trim() !== ""));
+  const headers = uniqueNames(
+    parsed[0].map((h) => sanitizeIdentifier(h || "column"))
+  );
+
+  const dataRows = parsed
+    .slice(1)
+    .filter((row) => row.some((cell) => (cell ?? "").trim() !== ""));
+
   const rowCount = dataRows.length;
 
   const normalizedTarget =
@@ -745,13 +754,19 @@ async function importCsvDataset(db: D1Database, request: Request) {
       ? sanitizeIdentifier(targetColumnField)
       : headers[headers.length - 1];
 
+  const targetIndex = headers.indexOf(normalizedTarget);
+  const finalTarget = targetIndex >= 0 ? normalizedTarget : headers[headers.length - 1];
+  const finalTargetIndex = headers.indexOf(finalTarget);
+
   const inferredTypes = headers.map((_, colIndex) => {
     const values = dataRows.map((row) => row[colIndex] ?? "");
     return inferColumnType(values);
   });
 
   const uniqueCounts = headers.map((_, colIndex) => {
-    const values = dataRows.map((row) => (row[colIndex] ?? "").trim()).filter((v) => v !== "");
+    const values = dataRows
+      .map((row) => (row[colIndex] ?? "").trim())
+      .filter((v) => v !== "");
     return new Set(values).size;
   });
 
@@ -787,7 +802,7 @@ async function importCsvDataset(db: D1Database, request: Request) {
       "",
       rowCount,
       headers.length,
-      normalizedTarget
+      finalTarget
     )
     .run();
 
@@ -809,15 +824,22 @@ async function importCsvDataset(db: D1Database, request: Request) {
 
   await db.exec(`CREATE TABLE IF NOT EXISTS "${tableName}" (${columnDefs});`);
 
-  const insertSql = `INSERT INTO "${tableName}" (${headers.map((h) => `"${h}"`).join(", ")}) VALUES (${headers.map(() => "?").join(", ")})`;
-  const statements: D1PreparedStatement[] = [];
+  const insertSql = `INSERT INTO "${tableName}" (${headers
+    .map((h) => `"${h}"`)
+    .join(", ")}) VALUES (${headers.map(() => "?").join(", ")})`;
 
-  for (const row of dataRows) {
+  const statements = dataRows.map((rawRow) => {
+    const row = [...rawRow];
+
+    while (row.length < headers.length) row.push("");
+    if (row.length > headers.length) row.length = headers.length;
+
     const values = headers.map((_, colIndex) =>
       coerceValue(row[colIndex] ?? "", inferredTypes[colIndex])
     );
-    statements.push(db.prepare(insertSql).bind(...values));
-  }
+
+    return db.prepare(insertSql).bind(...values);
+  });
 
   for (let i = 0; i < statements.length; i += 50) {
     await db.batch(statements.slice(i, i + 50));
@@ -840,7 +862,7 @@ async function importCsvDataset(db: D1Database, request: Request) {
         datasetId,
         header,
         inferredTypes[i],
-        header === normalizedTarget ? 1 : 0,
+        i === finalTargetIndex ? 1 : 0,
         nullCounts[i] > 0 ? 1 : 0,
         nullCounts[i],
         uniqueCounts[i]
@@ -851,7 +873,11 @@ async function importCsvDataset(db: D1Database, request: Request) {
     await db.batch(columnStatements.slice(i, i + 50));
   }
 
-  const preview = dataRows.slice(0, 10).map((row) => {
+  const preview = dataRows.slice(0, 10).map((rawRow) => {
+    const row = [...rawRow];
+    while (row.length < headers.length) row.push("");
+    if (row.length > headers.length) row.length = headers.length;
+
     const obj: Record<string, unknown> = {};
     headers.forEach((header, colIndex) => {
       obj[header] = coerceValue(row[colIndex] ?? "", inferredTypes[colIndex]);
@@ -859,12 +885,15 @@ async function importCsvDataset(db: D1Database, request: Request) {
     return obj;
   });
 
+  const inferredProblemType =
+    finalTargetIndex >= 0 && inferredTypes[finalTargetIndex] === "TEXT"
+      ? "classification"
+      : "regression";
+
   const problemType =
     typeof problemTypeField === "string" && problemTypeField.trim()
-      ? problemTypeField.trim()
-      : inferredTypes[headers.indexOf(normalizedTarget)] === "TEXT"
-        ? "classification"
-        : "regression";
+      ? (problemTypeField.trim() as "regression" | "classification")
+      : inferredProblemType;
 
   return json({
     ok: true,
@@ -879,13 +908,13 @@ async function importCsvDataset(db: D1Database, request: Request) {
       preview_key: tableName,
       row_count: rowCount,
       column_count: headers.length,
-      target_column: normalizedTarget,
+      target_column: finalTarget,
       problem_type: problemType,
     },
     columns: headers.map((header, i) => ({
       column_name: header,
       data_type: inferredTypes[i],
-      is_target: header === normalizedTarget ? 1 : 0,
+      is_target: i === finalTargetIndex ? 1 : 0,
       has_nulls: nullCounts[i] > 0 ? 1 : 0,
       null_count: nullCounts[i],
       unique_count: uniqueCounts[i],
@@ -893,12 +922,11 @@ async function importCsvDataset(db: D1Database, request: Request) {
     preview,
     stats: {
       total_rows: rowCount,
-      target_column: normalizedTarget,
+      target_column: finalTarget,
       problem_type: problemType,
     },
   });
 }
-
 async function executeSql(db: D1Database, body: any) {
   const query = String(body?.query ?? "").trim();
   if (!query) {
@@ -947,10 +975,8 @@ async function executeSql(db: D1Database, body: any) {
 
 async function handleBenchmark(db: D1Database, body: any, single = false) {
   const datasetId = Number(body?.datasetId);
-  const taskType = (body?.taskType ?? "classification") as TaskType;
-
-  if (!datasetId || !Number.isFinite(datasetId)) {
-    return json({ ok: false, error: "datasetId is required" }, 400);
+  if (!datasetId) {
+    return json({ ok: false, error: "datasetId required" }, 400);
   }
 
   const dataset = await getDatasetById(db, datasetId);
@@ -958,164 +984,34 @@ async function handleBenchmark(db: D1Database, body: any, single = false) {
     return json({ ok: false, error: "Dataset not found" }, 404);
   }
 
+  const taskType = (body?.taskType ?? "classification") as TaskType;
   const targetColumn =
-    typeof body?.targetColumn === "string" && body.targetColumn.trim()
-      ? sanitizeIdentifier(body.targetColumn)
-      : String(dataset.target_column ?? "").trim();
-
-  if (!targetColumn) {
-    return json({ ok: false, error: "targetColumn is required" }, 400);
-  }
-
-  const trainSplit = Number(body?.trainSplit ?? 80);
-  const randomState = Number(body?.randomState ?? 42);
-
-  const allowedModels =
-    taskType === "regression"
-      ? getDefaultModels("regression")
-      : getDefaultModels("classification");
+    body?.targetColumn || dataset.target_column || "target";
 
   const selectedModels = single
-    ? [String(body?.modelName ?? "")].filter(Boolean)
-    : Array.isArray(body?.models) && body.models.length > 0
-      ? body.models.map(String)
-      : allowedModels;
+    ? [body.modelName]
+    : body.models?.length
+      ? body.models
+      : getDefaultModels(taskType);
 
-  if (selectedModels.length === 0) {
-    return json({ ok: false, error: "No models selected" }, 400);
-  }
-
-  const paramsByModel: Record<string, Record<string, string | number | boolean>> =
-    body?.paramsByModel && typeof body.paramsByModel === "object"
-      ? body.paramsByModel
-      : {};
-
-  const experimentName =
-    typeof body?.experimentName === "string" && body.experimentName.trim()
-      ? body.experimentName.trim()
-      : single
-        ? `Single model run - ${selectedModels[0]}`
-        : `Benchmark - ${taskType} - ${dataset.name}`;
-
-  const experimentInsert = await db
-    .prepare(
-      `INSERT INTO experiments (
-        dataset_id,
-        experiment_name,
-        problem_type,
-        target_column,
-        train_size,
-        test_size,
-        random_state
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      datasetId,
-      experimentName,
-      taskType,
-      targetColumn,
-      Number((trainSplit / 100).toFixed(2)),
-      Number(((100 - trainSplit) / 100).toFixed(2)),
-      randomState
-    )
-    .run();
-
-  const experimentId = Number(experimentInsert.meta.last_row_id);
-  const results: BenchRun[] = [];
-
-  for (const modelName of selectedModels) {
-    const defaults = getDefaultParams(modelName);
-    const userParams = paramsByModel?.[modelName] ?? {};
-    const params = { ...defaults, ...userParams };
-
-    const run = buildRunResult(
-      datasetId,
-      taskType,
-      modelName,
-      params,
-      targetColumn,
-      trainSplit
-    );
-
-    const runInsert = await db
-      .prepare(
-        `INSERT INTO model_runs (
-          experiment_id,
-          model_name,
-          status,
-          started_at,
-          finished_at,
-          duration_ms,
-          error_message
-        ) VALUES (?, ?, ?, datetime('now'), datetime('now'), ?, ?)`
-      )
-      .bind(
-        experimentId,
-        modelName,
-        run.success ? "done" : "failed",
-        run.duration_ms,
-        run.error ?? null
-      )
-      .run();
-
-    const runId = Number(runInsert.meta.last_row_id);
-
-    await db
-      .prepare(`INSERT INTO model_configs (run_id, params_json) VALUES (?, ?)`)
-      .bind(runId, JSON.stringify(params))
-      .run();
-
-    if (run.success && run.metrics) {
-      for (const [metricName, metricValue] of Object.entries(run.metrics)) {
-        await db
-          .prepare(`INSERT INTO metrics (run_id, metric_name, metric_value) VALUES (?, ?, ?)`)
-          .bind(runId, metricName, metricValue)
-          .run();
-      }
-    }
-
-    await db
-      .prepare(
-        `INSERT INTO artifacts (run_id, artifact_type, artifact_key, created_at)
-         VALUES (?, ?, ?, datetime('now'))`
-      )
-      .bind(runId, "run_summary", `experiments/${experimentId}/runs/${runId}.json`)
-      .run();
-
-    results.push({ ...run, params });
-  }
-
-  const ranking = [...results].sort((a, b) => {
-    const aOk = a.success && a.score !== null;
-    const bOk = b.success && b.score !== null;
-    if (aOk !== bOk) return aOk ? -1 : 1;
-    return Number(b.score ?? -Infinity) - Number(a.score ?? -Infinity);
-  });
-
-  await db
-    .prepare(
-      `INSERT INTO artifacts (run_id, artifact_type, artifact_key, created_at)
-       VALUES (?, ?, ?, datetime('now'))`
-    )
-    .bind(experimentId, "leaderboard", `experiments/${experimentId}/leaderboard.json`)
-    .run();
-
-  return json({
-    ok: true,
-    experimentId,
+  const result = await persistBenchmark(db, {
     datasetId,
     taskType,
     targetColumn,
-    ranking: ranking.map((r) => ({
-      model: r.model,
-      success: r.success,
-      score: r.score,
-      duration_ms: r.duration_ms,
-      error: r.error ?? null,
-      params: r.params,
-      metrics: r.metrics ?? null,
-    })),
-    runs: results,
+    trainSplit: Number(body?.trainSplit ?? 80),
+    experimentName:
+      body?.experimentName ||
+      `Benchmark ${dataset.name}`,
+    selectedModels,
+    randomState: Number(body?.randomState ?? 42),
+    paramsByModel: body?.paramsByModel ?? {},
+  });
+
+  return json({
+    ok: true,
+    experimentId: result.experimentId,
+    ranking: result.ranking,
+    runs: result.results,
   });
 }
 
