@@ -38,91 +38,6 @@ const CLASSIFICATION_MODELS: ModelSpec[] = [
   { name: "AdaBoost", defaults: { n_estimators: 50, learning_rate: 1 } },
 ];
 
-const INIT_SQL = `
-CREATE TABLE IF NOT EXISTS datasets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  description TEXT,
-  source_type TEXT NOT NULL,
-  storage_key TEXT,
-  preview_key TEXT,
-  row_count INTEGER,
-  column_count INTEGER,
-  target_column TEXT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS dataset_columns (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  dataset_id INTEGER NOT NULL,
-  column_name TEXT NOT NULL,
-  data_type TEXT NOT NULL,
-  is_target INTEGER DEFAULT 0,
-  has_nulls INTEGER DEFAULT 0,
-  null_count INTEGER DEFAULT 0,
-  unique_count INTEGER DEFAULT 0,
-  FOREIGN KEY (dataset_id) REFERENCES datasets(id)
-);
-
-CREATE TABLE IF NOT EXISTS sql_queries (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  dataset_id INTEGER,
-  query_name TEXT,
-  query_text TEXT NOT NULL,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (dataset_id) REFERENCES datasets(id)
-);
-
-CREATE TABLE IF NOT EXISTS experiments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  dataset_id INTEGER NOT NULL,
-  experiment_name TEXT NOT NULL,
-  problem_type TEXT NOT NULL,
-  target_column TEXT NOT NULL,
-  train_size REAL NOT NULL DEFAULT 0.8,
-  test_size REAL NOT NULL DEFAULT 0.2,
-  random_state INTEGER NOT NULL DEFAULT 42,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (dataset_id) REFERENCES datasets(id)
-);
-
-CREATE TABLE IF NOT EXISTS model_runs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  experiment_id INTEGER NOT NULL,
-  model_name TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'queued',
-  started_at TEXT,
-  finished_at TEXT,
-  duration_ms INTEGER,
-  error_message TEXT,
-  FOREIGN KEY (experiment_id) REFERENCES experiments(id)
-);
-
-CREATE TABLE IF NOT EXISTS model_configs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id INTEGER NOT NULL,
-  params_json TEXT NOT NULL,
-  FOREIGN KEY (run_id) REFERENCES model_runs(id)
-);
-
-CREATE TABLE IF NOT EXISTS metrics (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id INTEGER NOT NULL,
-  metric_name TEXT NOT NULL,
-  metric_value REAL NOT NULL,
-  FOREIGN KEY (run_id) REFERENCES model_runs(id)
-);
-
-CREATE TABLE IF NOT EXISTS artifacts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  run_id INTEGER NOT NULL,
-  artifact_type TEXT NOT NULL,
-  artifact_key TEXT NOT NULL,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (run_id) REFERENCES model_runs(id)
-);
-`;
-
 let initPromise: Promise<void> | null = null;
 
 function corsHeaders() {
@@ -151,6 +66,19 @@ async function parseJson(request: Request) {
   }
 }
 
+async function tableExists(db: D1Database, table: string) {
+  const row = await db
+    .prepare(
+      `SELECT name
+       FROM sqlite_master
+       WHERE type = 'table' AND name = ?`
+    )
+    .bind(table)
+    .first<{ name: string }>();
+
+  return !!row;
+}
+
 async function columnExists(db: D1Database, table: string, column: string) {
   const res = await db.prepare(`PRAGMA table_info("${table}")`).all<any>();
   const rows = (res.results ?? []) as Array<{ name?: string }>;
@@ -169,10 +97,12 @@ async function ensureColumn(
   }
 }
 
-async function ensureSchema(db: D1Database) {
-  await db.exec(INIT_SQL);
+async function ensureCompatibility(db: D1Database) {
+  const hasExperiments = await tableExists(db, "experiments");
+  if (!hasExperiments) {
+    return;
+  }
 
-  // Compatibilidad con versiones anteriores del Worker.
   await ensureColumn(db, "experiments", "task_type", "TEXT");
   await ensureColumn(db, "experiments", "train_split", "INTEGER");
   await ensureColumn(db, "experiments", "results_json", "TEXT");
@@ -181,7 +111,7 @@ async function ensureSchema(db: D1Database) {
 
 async function initDb(db: D1Database) {
   if (!initPromise) {
-    initPromise = ensureSchema(db).then(() => undefined);
+    initPromise = ensureCompatibility(db).then(() => undefined);
   }
   await initPromise;
 }
@@ -328,8 +258,7 @@ function resolveDatasetTableName(dataset: any): string {
   if (Number(dataset.id) === 1) return "retail_sales";
   if (Number(dataset.id) === 2) return "saas_churn";
 
-  const storageKey =
-    typeof dataset.storage_key === "string" ? dataset.storage_key.trim() : "";
+  const storageKey = typeof dataset.storage_key === "string" ? dataset.storage_key.trim() : "";
   if (storageKey && /^[A-Za-z_][A-Za-z0-9_]*$/.test(storageKey)) return storageKey;
 
   return `dataset_${dataset.id}`;
@@ -362,12 +291,10 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
 
   const tableName = resolveDatasetTableName(dataset);
   const safeTable = /^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName) ? tableName : null;
-
   const preview = safeTable ? await fetchRows(db, `SELECT * FROM "${safeTable}" LIMIT 10`) : [];
 
   const targetMeta = columns.find((c: any) => Number(c.is_target) === 1) ?? null;
   const targetColumn = targetMeta?.column_name ?? dataset.target_column ?? null;
-
   const targetType = targetMeta?.data_type ? String(targetMeta.data_type).toUpperCase() : "";
   const targetUniqueCount = Number(targetMeta?.unique_count ?? 0);
 
@@ -504,10 +431,7 @@ async function getExperimentDetails(db: D1Database, experimentId: number) {
         metricMap.get("accuracy") ??
         null;
 
-      return {
-        ...run,
-        score,
-      };
+      return { ...run, score };
     })
     .sort((a, b) => {
       const aOk = a.status !== "failed" && a.score !== null;
@@ -607,14 +531,7 @@ function buildRunResult(
       score: f1,
       duration_ms,
       params,
-      metrics: {
-        accuracy,
-        precision,
-        recall,
-        f1,
-        roc_auc,
-        score: f1,
-      },
+      metrics: { accuracy, precision, recall, f1, roc_auc, score: f1 },
     };
   }
 
@@ -628,12 +545,7 @@ function buildRunResult(
     score: r2,
     duration_ms,
     params,
-    metrics: {
-      rmse,
-      mae,
-      r2,
-      score: r2,
-    },
+    metrics: { rmse, mae, r2, score: r2 },
   };
 }
 
@@ -746,10 +658,7 @@ async function persistBenchmark(
       .bind(runId, "run_summary", `experiments/${experimentId}/runs/${runId}.json`)
       .run();
 
-    results.push({
-      ...run,
-      params,
-    });
+    results.push({ ...run, params });
   }
 
   const ranking = [...results].sort((a, b) => Number(b.score ?? -999) - Number(a.score ?? -999));
@@ -812,6 +721,10 @@ async function importCsvDataset(db: D1Database, request: Request) {
   const headers = uniqueNames(parsed[0].map((h) => sanitizeIdentifier(h || "column")));
   if (headers.length === 0) {
     return json({ ok: false, error: "CSV header is empty" }, 400);
+  }
+
+  if (headers.length > 80) {
+    return json({ ok: false, error: "CSV has too many columns for D1 import" }, 400);
   }
 
   const dataRows = parsed
