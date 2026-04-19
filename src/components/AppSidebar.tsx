@@ -1,12 +1,27 @@
 import { NavLink } from "@/components/NavLink";
-import { useLocation } from "react-router-dom";
 import {
-  Home, Upload, Table2, Database, BarChart3, Brain,
-  TrendingUp, Code2, GitCompare, Settings, Beaker
+  Home,
+  Upload,
+  Table2,
+  Database,
+  BarChart3,
+  Brain,
+  TrendingUp,
+  Code2,
+  GitCompare,
+  Settings,
+  Beaker,
+  Wrench,
 } from "lucide-react";
 import {
-  Sidebar, SidebarContent, SidebarGroup, SidebarGroupContent,
-  SidebarGroupLabel, SidebarMenu, SidebarMenuButton, SidebarMenuItem,
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar";
 
@@ -14,6 +29,7 @@ const mainItems = [
   { title: "Home", url: "/", icon: Home },
   { title: "Upload Dataset", url: "/upload", icon: Upload },
   { title: "Dataset Explorer", url: "/explorer", icon: Table2 },
+  { title: "Data Prep Workspace", url: "/data-prep", icon: Wrench },
   { title: "SQL Lab", url: "/sql-lab", icon: Database },
   { title: "Data Viz", url: "/data-viz", icon: BarChart3 },
 ];
@@ -68,11 +84,14 @@ export function AppSidebar() {
         </div>
         {!collapsed && (
           <div>
-            <h1 className="font-heading font-bold text-base text-foreground">ML Playground</h1>
+            <h1 className="font-heading font-bold text-base text-foreground">
+              ML Playground
+            </h1>
             <p className="text-[10px] text-muted-foreground">Learning by doing</p>
           </div>
         )}
       </div>
+
       <SidebarContent className="py-2">
         {renderGroup("Data", mainItems)}
         {renderGroup("Machine Learning", mlItems)}

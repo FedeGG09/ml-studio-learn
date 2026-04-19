@@ -14,6 +14,7 @@ import ModelLab from "./pages/ModelLab";
 import TrainingResults from "./pages/TrainingResults";
 import CodeViewer from "./pages/CodeViewer";
 import ExperimentComparison from "./pages/ExperimentComparison";
+import DataPrep from "./pages/DataPrep";
 import AdminDatasets from "./pages/AdminDatasets";
 import NotFound from "./pages/NotFound";
 
@@ -43,6 +44,7 @@ const App = () => (
             <Route path="/code-viewer" element={<CodeViewer />} />
             <Route path="/comparison" element={<ExperimentComparison />} />
             <Route path="/admin" element={<AdminDatasets />} />
+            <Route path="/data-prep" element={<DataPrep />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </DashboardLayout>

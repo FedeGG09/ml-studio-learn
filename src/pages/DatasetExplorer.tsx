@@ -9,6 +9,7 @@ import {
   AlertTriangle,
   BarChart,
   Rocket,
+  Wrench,
 } from "lucide-react";
 
 export default function DatasetExplorer() {
@@ -53,14 +54,23 @@ export default function DatasetExplorer() {
           <p className="section-subtitle mt-1">{dataset.description}</p>
         </div>
 
-        {/* CTA PREMIUM */}
-        <Link
-          to={`/model-lab?datasetId=${datasetId}&target=${targetColumn}&problemType=${problemType}`}
-          className="inline-flex items-center gap-2 rounded-xl px-5 py-3 bg-primary text-primary-foreground hover:opacity-90 transition-all shadow-lg"
-        >
-          <Rocket className="h-4 w-4" />
-          Open in Model Lab
-        </Link>
+        <div className="flex flex-wrap gap-3">
+          <Link
+            to={`/data-prep?datasetId=${datasetId}`}
+            className="inline-flex items-center gap-2 rounded-xl px-5 py-3 border border-primary text-primary hover:bg-primary/10 transition-all"
+          >
+            <Wrench className="h-4 w-4" />
+            Preparar datos
+          </Link>
+
+          <Link
+            to={`/model-lab?datasetId=${datasetId}&target=${targetColumn}&problemType=${problemType}`}
+            className="inline-flex items-center gap-2 rounded-xl px-5 py-3 bg-primary text-primary-foreground hover:opacity-90 transition-all shadow-lg"
+          >
+            <Rocket className="h-4 w-4" />
+            Open in Model Lab
+          </Link>
+        </div>
       </div>
 
       <ExplanationBox
