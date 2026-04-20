@@ -48,6 +48,10 @@ const CLASSIFICATION_MODELS: ModelSpec[] = [
 
 let initPromise: Promise<void> | null = null;
 
+/* =========================
+   Utils
+========================= */
+
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -74,13 +78,152 @@ async function parseJson(request: Request) {
   }
 }
 
+function sanitizeIdentifier(input: string): string {
+  const cleaned = input
+    .normalize("NFKD")
+    .replace(/[^\w]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase();
+
+  return cleaned || "col";
+}
+
+function uniqueNames(names: string[]): string[] {
+  const seen = new Map<string, number>();
+  return names.map((name) => {
+    const count = seen.get(name) ?? 0;
+    seen.set(name, count + 1);
+    return count === 0 ? name : `${name}_${count + 1}`;
+  });
+}
+
+function quoteIdent(value: string) {
+  return `"${String(value).replace(/"/g, '""')}"`;
+}
+
+function stableNoise(...parts: Array<string | number>) {
+  const input = parts.join("|");
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) / 4294967295;
+}
+
+function inferColumnType(values: string[]): "INTEGER" | "REAL" | "TEXT" {
+  const nonEmpty = values.map((v) => v.trim()).filter((v) => v !== "");
+  if (nonEmpty.length === 0) return "TEXT";
+
+  const isInteger = (value: string) => /^-?\d+$/.test(value);
+  const isReal = (value: string) => /^-?\d+(\.\d+)?$/.test(value);
+
+  let integerLike = 0;
+  let numericLike = 0;
+
+  for (const value of nonEmpty) {
+    if (isInteger(value)) {
+      integerLike += 1;
+      numericLike += 1;
+    } else if (isReal(value)) {
+      numericLike += 1;
+    } else {
+      return "TEXT";
+    }
+  }
+
+  if (integerLike === nonEmpty.length) return "INTEGER";
+  if (numericLike === nonEmpty.length) return "REAL";
+  return "TEXT";
+}
+
+function coerceValue(value: string, type: "INTEGER" | "REAL" | "TEXT") {
+  const trimmed = value.trim();
+  if (trimmed === "") return null;
+
+  if (type === "INTEGER") {
+    const n = Number.parseInt(trimmed, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  if (type === "REAL") {
+    const n = Number.parseFloat(trimmed);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  return value;
+}
+
+function getModelRegistry(taskType: TaskType) {
+  return taskType === "regression" ? REGRESSION_MODELS : CLASSIFICATION_MODELS;
+}
+
+function getDefaultModels(taskType: TaskType) {
+  return getModelRegistry(taskType).map((m) => m.name);
+}
+
+function getDefaultParams(modelName: string) {
+  const all = [...REGRESSION_MODELS, ...CLASSIFICATION_MODELS];
+  return all.find((m) => m.name === modelName)?.defaults ?? {};
+}
+
+function resolveDatasetTableName(dataset: any): string {
+  if (!dataset) return "unknown";
+  if (Number(dataset.id) === 1) return "retail_sales";
+  if (Number(dataset.id) === 2) return "saas_churn";
+
+  const storageKey = typeof dataset.storage_key === "string" ? dataset.storage_key.trim() : "";
+  if (storageKey && /^[A-Za-z_][A-Za-z0-9_]*$/.test(storageKey)) return storageKey;
+
+  return `dataset_${dataset.id}`;
+}
+
+async function fetchRows(db: D1Database, sql: string, params: any[] = []) {
+  const stmt = params.length ? db.prepare(sql).bind(...params) : db.prepare(sql);
+  const { results } = await stmt.all();
+  return results ?? [];
+}
+
+async function fetchSingle(db: D1Database, sql: string, params: any[] = []) {
+  const stmt = params.length ? db.prepare(sql).bind(...params) : db.prepare(sql);
+  return stmt.first<any>();
+}
+
+function getOutputName(originalName: string, renameMap: Record<string, string>) {
+  const renamed = typeof renameMap[originalName] === "string" ? renameMap[originalName].trim() : "";
+  return renamed || originalName;
+}
+
+function buildDerivedExpression(col: DerivedColumnSpec) {
+  const left = quoteIdent(col.left);
+  const right = col.right ? quoteIdent(col.right) : null;
+
+  switch (col.op) {
+    case "concat":
+      if (!right) return `COALESCE(${left}, '')`;
+      return `COALESCE(${left}, '') || '${(col.separator ?? " ").replace(/'/g, "''")}' || COALESCE(${right}, '')`;
+    case "sum":
+      return right ? `${left} + ${right}` : "NULL";
+    case "difference":
+      return right ? `${left} - ${right}` : "NULL";
+    case "product":
+      return right ? `${left} * ${right}` : "NULL";
+    case "ratio":
+      return right ? `${left} / NULLIF(${right}, 0)` : "NULL";
+  }
+}
+
+function inferredDerivedType(op: DerivedColumnSpec["op"]) {
+  return op === "concat" ? "TEXT" : "REAL";
+}
+
+/* =========================
+   Schema / compatibility
+========================= */
+
 async function tableExists(db: D1Database, table: string) {
   const row = await db
-    .prepare(
-      `SELECT name
-       FROM sqlite_master
-       WHERE type = 'table' AND name = ?`
-    )
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
     .bind(table)
     .first<{ name: string }>();
 
@@ -118,56 +261,14 @@ async function ensureCompatibility(db: D1Database) {
   const hasExperiments = await tableExists(db, "experiments");
   if (hasExperiments) {
     await ensureColumn(db, "experiments", "task_type", "TEXT");
-    await ensureColumn(db, "experiments", "train_split", "INTEGER");
+    await ensureColumn(db, "experiments", "train_split", "REAL");
     await ensureColumn(db, "experiments", "results_json", "TEXT");
     await ensureColumn(db, "experiments", "hyperparams_json", "TEXT");
     await ensureColumn(db, "experiments", "feature_columns_json", "TEXT");
   }
 
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS dataset_preparations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      dataset_id INTEGER NOT NULL,
-      version_name TEXT NOT NULL,
-      source_table TEXT NOT NULL,
-      prepared_table TEXT NOT NULL,
-      target_column TEXT NOT NULL,
-      selected_features_json TEXT NOT NULL,
-      rename_map_json TEXT,
-      derived_columns_json TEXT,
-      prep_config_json TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
-    );
-  `);
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS feature_selections (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      dataset_id INTEGER NOT NULL,
-      preparation_id INTEGER,
-      target_column TEXT NOT NULL,
-      selected_features_json TEXT NOT NULL,
-      dropped_features_json TEXT,
-      task_type TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
-      FOREIGN KEY (preparation_id) REFERENCES dataset_preparations(id) ON DELETE SET NULL
-    );
-  `);
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS dataset_transformations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      dataset_id INTEGER NOT NULL,
-      preparation_id INTEGER,
-      transformation_type TEXT NOT NULL,
-      transformation_json TEXT NOT NULL,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
-      FOREIGN KEY (preparation_id) REFERENCES dataset_preparations(id) ON DELETE SET NULL
-    );
-  `);
+  // Las tablas nuevas ya viven en cloudflare/schema.sql.
+  // No se crean acá.
 }
 
 async function initDb(db: D1Database) {
@@ -177,53 +278,9 @@ async function initDb(db: D1Database) {
   await initPromise;
 }
 
-function sanitizeIdentifier(input: string): string {
-  const cleaned = input
-    .normalize("NFKD")
-    .replace(/[^\w]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .toLowerCase();
-
-  return cleaned || "col";
-}
-
-function uniqueNames(names: string[]): string[] {
-  const seen = new Map<string, number>();
-  return names.map((name) => {
-    const count = seen.get(name) ?? 0;
-    seen.set(name, count + 1);
-    return count === 0 ? name : `${name}_${count + 1}`;
-  });
-}
-
-function quoteIdent(value: string) {
-  return `"${String(value).replace(/"/g, '""')}"`;
-}
-
-function buildDerivedExpression(col: DerivedColumnSpec) {
-  const left = quoteIdent(col.left);
-  const right = col.right ? quoteIdent(col.right) : null;
-
-  switch (col.op) {
-    case "concat":
-      if (!right) {
-        return `COALESCE(${left}, '')`;
-      }
-      return `COALESCE(${left}, '') || '${(col.separator ?? " ").replace(/'/g, "''")}' || COALESCE(${right}, '')`;
-    case "sum":
-      return right ? `${left} + ${right}` : "NULL";
-    case "difference":
-      return right ? `${left} - ${right}` : "NULL";
-    case "product":
-      return right ? `${left} * ${right}` : "NULL";
-    case "ratio":
-      return right ? `${left} / NULLIF(${right}, 0)` : "NULL";
-  }
-}
-
-function inferredDerivedType(op: DerivedColumnSpec["op"]) {
-  return op === "concat" ? "TEXT" : "REAL";
-}
+/* =========================
+   CSV / import
+========================= */
 
 function parseCsv(text: string): string[][] {
   const rows: string[][] = [];
@@ -277,94 +334,6 @@ function parseCsv(text: string): string[][] {
   return rows;
 }
 
-function inferColumnType(values: string[]): "INTEGER" | "REAL" | "TEXT" {
-  const nonEmpty = values.map((v) => v.trim()).filter((v) => v !== "");
-  if (nonEmpty.length === 0) return "TEXT";
-
-  const isInteger = (value: string) => /^-?\d+$/.test(value);
-  const isReal = (value: string) => /^-?\d+(\.\d+)?$/.test(value);
-
-  let integerLike = 0;
-  let numericLike = 0;
-
-  for (const value of nonEmpty) {
-    if (isInteger(value)) {
-      integerLike += 1;
-      numericLike += 1;
-    } else if (isReal(value)) {
-      numericLike += 1;
-    } else {
-      return "TEXT";
-    }
-  }
-
-  if (integerLike === nonEmpty.length) return "INTEGER";
-  if (numericLike === nonEmpty.length) return "REAL";
-  return "TEXT";
-}
-
-function coerceValue(value: string, type: "INTEGER" | "REAL" | "TEXT") {
-  const trimmed = value.trim();
-  if (trimmed === "") return null;
-
-  if (type === "INTEGER") {
-    const n = Number.parseInt(trimmed, 10);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  if (type === "REAL") {
-    const n = Number.parseFloat(trimmed);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  return value;
-}
-
-function stableNoise(...parts: Array<string | number>) {
-  const input = parts.join("|");
-  let hash = 2166136261;
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0) / 4294967295;
-}
-
-function getModelRegistry(taskType: TaskType) {
-  return taskType === "regression" ? REGRESSION_MODELS : CLASSIFICATION_MODELS;
-}
-
-function getDefaultModels(taskType: TaskType) {
-  return getModelRegistry(taskType).map((m) => m.name);
-}
-
-function getDefaultParams(modelName: string) {
-  const all = [...REGRESSION_MODELS, ...CLASSIFICATION_MODELS];
-  return all.find((m) => m.name === modelName)?.defaults ?? {};
-}
-
-function resolveDatasetTableName(dataset: any): string {
-  if (!dataset) return "unknown";
-  if (Number(dataset.id) === 1) return "retail_sales";
-  if (Number(dataset.id) === 2) return "saas_churn";
-
-  const storageKey = typeof dataset.storage_key === "string" ? dataset.storage_key.trim() : "";
-  if (storageKey && /^[A-Za-z_][A-Za-z0-9_]*$/.test(storageKey)) return storageKey;
-
-  return `dataset_${dataset.id}`;
-}
-
-async function fetchRows(db: D1Database, sql: string, params: any[] = []) {
-  const stmt = params.length ? db.prepare(sql).bind(...params) : db.prepare(sql);
-  const { results } = await stmt.all();
-  return results ?? [];
-}
-
-async function fetchSingle(db: D1Database, sql: string, params: any[] = []) {
-  const stmt = params.length ? db.prepare(sql).bind(...params) : db.prepare(sql);
-  return stmt.first<any>();
-}
-
 async function getDatasetById(db: D1Database, id: number) {
   return fetchSingle(db, "SELECT * FROM datasets WHERE id = ?", [id]);
 }
@@ -404,10 +373,7 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
     if (targetType === "TEXT") {
       const row = await fetchSingle(
         db,
-        `SELECT
-           COUNT(*) AS total_rows,
-           COUNT(DISTINCT "${targetColumn}") AS class_count
-         FROM "${safeTable}"`
+        `SELECT COUNT(*) AS total_rows, COUNT(DISTINCT "${targetColumn}") AS class_count FROM "${safeTable}"`
       );
       stats = {
         total_rows: Number(row?.total_rows ?? 0),
@@ -416,10 +382,7 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
     } else if (["INTEGER", "REAL"].includes(targetType) && targetUniqueCount <= 2) {
       const row = await fetchSingle(
         db,
-        `SELECT
-           COUNT(*) AS total_rows,
-           ROUND(AVG("${targetColumn}") * 100, 2) AS target_positive_rate_pct
-         FROM "${safeTable}"`
+        `SELECT COUNT(*) AS total_rows, ROUND(AVG("${targetColumn}") * 100, 2) AS target_positive_rate_pct FROM "${safeTable}"`
       );
       stats = {
         total_rows: Number(row?.total_rows ?? 0),
@@ -428,10 +391,7 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
     } else if (["INTEGER", "REAL"].includes(targetType)) {
       const row = await fetchSingle(
         db,
-        `SELECT
-           COUNT(*) AS total_rows,
-           ROUND(AVG("${targetColumn}"), 2) AS avg_target
-         FROM "${safeTable}"`
+        `SELECT COUNT(*) AS total_rows, ROUND(AVG("${targetColumn}"), 2) AS avg_target FROM "${safeTable}"`
       );
       stats = {
         total_rows: Number(row?.total_rows ?? 0),
@@ -458,345 +418,6 @@ async function getDatasetProfile(db: D1Database, datasetId: number) {
     preview,
     stats,
   };
-}
-
-async function getExperimentDetails(db: D1Database, experimentId: number) {
-  const experiment = await fetchSingle(
-    db,
-    "SELECT * FROM experiments WHERE id = ?",
-    [experimentId]
-  );
-
-  if (!experiment) return null;
-
-  const runs = await fetchRows(
-    db,
-    "SELECT * FROM model_runs WHERE experiment_id = ? ORDER BY id ASC",
-    [experimentId]
-  );
-
-  const runIds = runs.map((r: any) => Number(r.id));
-  const placeholders = runIds.map(() => "?").join(",");
-
-  const configs =
-    runIds.length > 0
-      ? await fetchRows(db, `SELECT * FROM model_configs WHERE run_id IN (${placeholders})`, runIds)
-      : [];
-
-  const metrics =
-    runIds.length > 0
-      ? await fetchRows(db, `SELECT * FROM metrics WHERE run_id IN (${placeholders}) ORDER BY id ASC`, runIds)
-      : [];
-
-  const artifacts =
-    runIds.length > 0
-      ? await fetchRows(db, `SELECT * FROM artifacts WHERE run_id IN (${placeholders}) ORDER BY id ASC`, runIds)
-      : [];
-
-  const configByRun = new Map<number, any>();
-  for (const cfg of configs as any[]) configByRun.set(Number(cfg.run_id), cfg);
-
-  const metricsByRun = new Map<number, any[]>();
-  for (const metric of metrics as any[]) {
-    const runId = Number(metric.run_id);
-    metricsByRun.set(runId, [...(metricsByRun.get(runId) ?? []), metric]);
-  }
-
-  const artifactsByRun = new Map<number, any[]>();
-  for (const art of artifacts as any[]) {
-    const runId = Number(art.run_id);
-    artifactsByRun.set(runId, [...(artifactsByRun.get(runId) ?? []), art]);
-  }
-
-  const runsWithDetails = (runs as any[]).map((run) => ({
-    ...run,
-    config: configByRun.get(Number(run.id)) ?? null,
-    metrics: metricsByRun.get(Number(run.id)) ?? [],
-    artifacts: artifactsByRun.get(Number(run.id)) ?? [],
-  }));
-
-  const leaderboard = runsWithDetails
-    .map((run) => {
-      const metricMap = new Map<string, number>();
-      for (const metric of run.metrics ?? []) {
-        metricMap.set(metric.metric_name, Number(metric.metric_value));
-      }
-
-      const score =
-        metricMap.get("score") ??
-        metricMap.get("f1") ??
-        metricMap.get("r2") ??
-        metricMap.get("accuracy") ??
-        null;
-
-      return { ...run, score };
-    })
-    .sort((a, b) => {
-      const aOk = a.status !== "failed" && a.score !== null;
-      const bOk = b.status !== "failed" && b.score !== null;
-      if (aOk !== bOk) return aOk ? -1 : 1;
-      return Number(b.score ?? -Infinity) - Number(a.score ?? -Infinity);
-    });
-
-  return {
-    experiment,
-    runs: runsWithDetails,
-    leaderboard,
-  };
-}
-
-async function listExperiments(db: D1Database, datasetId?: number) {
-  const experiments = datasetId
-    ? await fetchRows(
-        db,
-        "SELECT * FROM experiments WHERE dataset_id = ? ORDER BY id DESC",
-        [datasetId]
-      )
-    : await fetchRows(db, "SELECT * FROM experiments ORDER BY id DESC");
-
-  const out = [];
-  for (const exp of experiments as any[]) {
-    const details = await getExperimentDetails(db, Number(exp.id));
-    if (!details) continue;
-
-    out.push({
-      id: exp.id,
-      dataset_id: exp.dataset_id,
-      experiment_name: exp.experiment_name,
-      problem_type: exp.problem_type,
-      task_type: exp.task_type ?? exp.problem_type ?? null,
-      target_column: exp.target_column,
-      train_size: exp.train_size,
-      test_size: exp.test_size,
-      train_split: exp.train_split ?? null,
-      random_state: exp.random_state,
-      results_json: exp.results_json ?? null,
-      hyperparams_json: exp.hyperparams_json ?? null,
-      feature_columns_json: exp.feature_columns_json ?? null,
-      created_at: exp.created_at,
-      run_count: details.runs.length,
-      failed_runs: details.runs.filter((r: any) => r.status === "failed").length,
-      best_model: details.leaderboard[0]?.model_name ?? null,
-      best_score: details.leaderboard[0]?.score ?? null,
-      leaderboard: details.leaderboard,
-    });
-  }
-
-  return out;
-}
-
-function getOutputName(originalName: string, renameMap: Record<string, string>) {
-  const renamed = typeof renameMap[originalName] === "string" ? renameMap[originalName].trim() : "";
-  return renamed || originalName;
-}
-
-function buildRunResult(
-  datasetId: number,
-  taskType: TaskType,
-  modelName: string,
-  params: Record<string, string | number | boolean>,
-  targetColumn: string,
-  trainSplit: number
-): BenchRun {
-  const seed = stableNoise(
-    datasetId,
-    taskType,
-    modelName,
-    targetColumn,
-    trainSplit,
-    JSON.stringify(params)
-  );
-  const failSeed = stableNoise("fail", datasetId, taskType, modelName, targetColumn);
-  const failureChance = 0.14 + (modelName === "SVM" ? 0.04 : 0) + (modelName === "KNN" ? 0.02 : 0);
-  const success = failSeed > failureChance;
-  const duration_ms = Math.round(350 + seed * 2600);
-
-  if (!success) {
-    return {
-      model: modelName,
-      success: false,
-      score: null,
-      error: "Training failed: feature mismatch / convergence / numerical issue",
-      duration_ms,
-      params,
-    };
-  }
-
-  if (taskType === "classification") {
-    const accuracy = Number((0.68 + seed * 0.28).toFixed(4));
-    const precision = Number(Math.max(0.5, accuracy - 0.04 + seed * 0.03).toFixed(4));
-    const recall = Number(Math.max(0.5, accuracy - 0.03 + seed * 0.02).toFixed(4));
-    const f1 = Number(((2 * precision * recall) / (precision + recall)).toFixed(4));
-    const roc_auc = Number(Math.min(0.99, accuracy + 0.04 + seed * 0.02).toFixed(4));
-
-    return {
-      model: modelName,
-      success: true,
-      score: f1,
-      duration_ms,
-      params,
-      metrics: { accuracy, precision, recall, f1, roc_auc, score: f1 },
-    };
-  }
-
-  const r2 = Number((0.55 + seed * 0.4).toFixed(4));
-  const rmse = Number((5 + (1 - r2) * 30).toFixed(4));
-  const mae = Number((rmse * 0.76).toFixed(4));
-
-  return {
-    model: modelName,
-    success: true,
-    score: r2,
-    duration_ms,
-    params,
-    metrics: { rmse, mae, r2, score: r2 },
-  };
-}
-
-async function persistBenchmark(
-  db: D1Database,
-  input: {
-    datasetId: number;
-    taskType: TaskType;
-    targetColumn: string;
-    trainSplit: number;
-    experimentName: string;
-    selectedModels: string[];
-    randomState: number;
-    paramsByModel?: Record<string, Record<string, string | number | boolean>>;
-    featureColumns?: string[];
-  }
-) {
-  const experimentInsert = await db
-    .prepare(
-      `INSERT INTO experiments (
-        dataset_id,
-        experiment_name,
-        problem_type,
-        target_column,
-        train_size,
-        test_size,
-        random_state,
-        task_type,
-        train_split,
-        results_json,
-        hyperparams_json,
-        feature_columns_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .bind(
-      input.datasetId,
-      input.experimentName,
-      input.taskType,
-      input.targetColumn,
-      input.trainSplit / 100,
-      (100 - input.trainSplit) / 100,
-      input.randomState,
-      input.taskType,
-      input.trainSplit,
-      null,
-      JSON.stringify(input.paramsByModel ?? {}),
-      JSON.stringify(input.featureColumns ?? [])
-    )
-    .run();
-
-  const experimentId = Number(experimentInsert.meta.last_row_id);
-  const results: BenchRun[] = [];
-  let firstRunId: number | null = null;
-
-  for (const modelName of input.selectedModels) {
-    const params = {
-      ...getDefaultParams(modelName),
-      ...(input.paramsByModel?.[modelName] ?? {}),
-    };
-
-    const run = buildRunResult(
-      input.datasetId,
-      input.taskType,
-      modelName,
-      params,
-      input.targetColumn,
-      input.trainSplit
-    );
-
-    const runInsert = await db
-      .prepare(
-        `INSERT INTO model_runs (
-          experiment_id,
-          model_name,
-          status,
-          started_at,
-          finished_at,
-          duration_ms,
-          error_message
-        ) VALUES (?, ?, ?, datetime('now'), datetime('now'), ?, ?)`
-      )
-      .bind(
-        experimentId,
-        modelName,
-        run.success ? "done" : "failed",
-        run.duration_ms,
-        run.error ?? null
-      )
-      .run();
-
-    const runId = Number(runInsert.meta.last_row_id);
-    if (!firstRunId) firstRunId = runId;
-
-    await db
-      .prepare(`INSERT INTO model_configs (run_id, params_json) VALUES (?, ?)`)
-      .bind(runId, JSON.stringify(params))
-      .run();
-
-    if (run.metrics) {
-      for (const [metricName, metricValue] of Object.entries(run.metrics)) {
-        await db
-          .prepare(`INSERT INTO metrics (run_id, metric_name, metric_value) VALUES (?, ?, ?)`)
-          .bind(runId, metricName, metricValue)
-          .run();
-      }
-    }
-
-    await db
-      .prepare(
-        `INSERT INTO artifacts (run_id, artifact_type, artifact_key)
-         VALUES (?, ?, ?)`
-      )
-      .bind(runId, "run_summary", `experiments/${experimentId}/runs/${runId}.json`)
-      .run();
-
-    results.push({ ...run, params });
-  }
-
-  const ranking = [...results].sort((a, b) => Number(b.score ?? -999) - Number(a.score ?? -999));
-
-  if (firstRunId) {
-    await db
-      .prepare(
-        `INSERT INTO artifacts (run_id, artifact_type, artifact_key)
-         VALUES (?, ?, ?)`
-      )
-      .bind(firstRunId, "leaderboard", `experiments/${experimentId}/leaderboard.json`)
-      .run();
-  }
-
-  await db
-    .prepare(
-      `UPDATE experiments
-       SET results_json = ?, hyperparams_json = ?
-       WHERE id = ?`
-    )
-    .bind(
-      JSON.stringify({
-        ranking,
-        runs: results,
-      }),
-      JSON.stringify(input.paramsByModel ?? {}),
-      experimentId
-    )
-    .run();
-
-  return { experimentId, results, ranking };
 }
 
 async function importCsvDataset(db: D1Database, request: Request) {
@@ -885,40 +506,23 @@ async function importCsvDataset(db: D1Database, request: Request) {
         row_count, column_count, target_column
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .bind(
-      datasetName,
-      description,
-      "csv",
-      "",
-      "",
-      rowCount,
-      headers.length,
-      finalTarget
-    )
+    .bind(datasetName, description, "csv", "", "", rowCount, headers.length, finalTarget)
     .run();
 
   const datasetId = Number(datasetInsert.meta.last_row_id);
   const tableName = `dataset_${datasetId}`;
 
   await db
-    .prepare(
-      `UPDATE datasets
-       SET storage_key = ?, preview_key = ?
-       WHERE id = ?`
-    )
+    .prepare(`UPDATE datasets SET storage_key = ?, preview_key = ? WHERE id = ?`)
     .bind(tableName, tableName, datasetId)
     .run();
 
-  const columnDefs = headers
-    .map((header, i) => `"${header}" ${inferredTypes[i]}`)
-    .join(", ");
+  const columnDefs = headers.map((header, i) => `"${header}" ${inferredTypes[i]}`).join(", ");
 
   await db.exec(`DROP TABLE IF EXISTS "${tableName}";`);
   await db.exec(`CREATE TABLE "${tableName}" (${columnDefs});`);
 
-  const insertSql = `INSERT INTO "${tableName}" (${headers
-    .map((h) => `"${h}"`)
-    .join(", ")}) VALUES (${headers.map(() => "?").join(", ")})`;
+  const insertSql = `INSERT INTO "${tableName}" (${headers.map((h) => `"${h}"`).join(", ")}) VALUES (${headers.map(() => "?").join(", ")})`;
 
   const statements: D1PreparedStatement[] = [];
   for (const rawRow of dataRows) {
@@ -941,13 +545,7 @@ async function importCsvDataset(db: D1Database, request: Request) {
     db
       .prepare(
         `INSERT INTO dataset_columns (
-          dataset_id,
-          column_name,
-          data_type,
-          is_target,
-          has_nulls,
-          null_count,
-          unique_count
+          dataset_id, column_name, data_type, is_target, has_nulls, null_count, unique_count
         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
@@ -1019,6 +617,10 @@ async function importCsvDataset(db: D1Database, request: Request) {
     },
   });
 }
+
+/* =========================
+   Dataset prep
+========================= */
 
 async function handlePrepareDataset(db: D1Database, datasetId: number, body: any) {
   const dataset = await getDatasetById(db, datasetId);
@@ -1126,10 +728,7 @@ async function handlePrepareDataset(db: D1Database, datasetId: number, body: any
   const safeSource = /^[A-Za-z_][A-Za-z0-9_]*$/.test(sourceTable) ? sourceTable : null;
   if (!safeSource) return json({ ok: false, error: "Invalid source table" }, 400);
 
-  const directColumns = [
-    ...selectedFeatures,
-    targetColumn,
-  ].map((originalName) => {
+  const directColumns = [...selectedFeatures, targetColumn].map((originalName) => {
     const meta = sourceColumnsMap.get(originalName);
     return {
       sourceName: originalName,
@@ -1149,8 +748,7 @@ async function handlePrepareDataset(db: D1Database, datasetId: number, body: any
   }));
 
   const outputNames = [...directColumns.map((c) => c.outputName), ...derivedMeta.map((c) => c.outputName)];
-  const uniqueOutputNames = new Set(outputNames);
-  if (uniqueOutputNames.size !== outputNames.length) {
+  if (new Set(outputNames).size !== outputNames.length) {
     return json(
       {
         ok: false,
@@ -1168,9 +766,7 @@ async function handlePrepareDataset(db: D1Database, datasetId: number, body: any
     .join(", ");
 
   const selectFragments = [
-    ...directColumns.map(
-      (col) => `${quoteIdent(col.sourceName)} AS ${quoteIdent(col.outputName)}`
-    ),
+    ...directColumns.map((col) => `${quoteIdent(col.sourceName)} AS ${quoteIdent(col.outputName)}`),
     ...derivedMeta.map((col) => `${col.expression} AS ${quoteIdent(col.outputName)}`),
   ];
 
@@ -1245,24 +841,10 @@ async function handlePrepareDataset(db: D1Database, datasetId: number, body: any
     db
       .prepare(
         `INSERT INTO dataset_columns (
-          dataset_id,
-          column_name,
-          data_type,
-          is_target,
-          has_nulls,
-          null_count,
-          unique_count
+          dataset_id, column_name, data_type, is_target, has_nulls, null_count, unique_count
         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
       )
-      .bind(
-        preparedDatasetId,
-        col.outputName,
-        col.dataType,
-        col.isTarget,
-        0,
-        0,
-        0
-      )
+      .bind(preparedDatasetId, col.outputName, col.dataType, col.isTarget, 0, 0, 0)
   );
 
   for (let i = 0; i < preparedColumnStatements.length; i += 50) {
@@ -1324,11 +906,7 @@ async function handlePrepareDataset(db: D1Database, datasetId: number, body: any
       preparationId,
       targetOutput,
       JSON.stringify(selectedFeatureOutputs),
-      JSON.stringify(
-        [...sourceColumnsMap.keys()].filter(
-          (col) => col !== targetColumn && !selectedFeatures.includes(col)
-        )
-      ),
+      JSON.stringify([...sourceColumnsMap.keys()].filter((col) => col !== targetColumn && !selectedFeatures.includes(col))),
       taskType
     )
     .run();
@@ -1393,11 +971,13 @@ async function handlePrepareDataset(db: D1Database, datasetId: number, body: any
       unique_count: 0,
     })),
     preview: preparedProfile?.preview ?? preparedPreview,
-    stats: preparedProfile?.stats ?? {
-      total_rows: sourceRowCount,
-    },
+    stats: preparedProfile?.stats ?? { total_rows: sourceRowCount },
   });
 }
+
+/* =========================
+   SQL Lab
+========================= */
 
 async function executeSql(db: D1Database, body: any) {
   const query = String(body?.query ?? "").trim();
@@ -1407,13 +987,7 @@ async function executeSql(db: D1Database, body: any) {
 
   const keyword = query.split(/\s+/)[0].toUpperCase();
   if (!["SELECT", "WITH", "PRAGMA", "EXPLAIN"].includes(keyword)) {
-    return json(
-      {
-        ok: false,
-        error: "Only read-only SQL is allowed in SQL Lab",
-      },
-      400
-    );
+    return json({ ok: false, error: "Only read-only SQL is allowed in SQL Lab" }, 400);
   }
 
   const datasetId = body?.datasetId ? Number(body.datasetId) : null;
@@ -1437,14 +1011,297 @@ async function executeSql(db: D1Database, body: any) {
 
     return json({ ok: true, results, meta });
   } catch (error: any) {
-    return json(
-      {
-        ok: false,
-        error: error?.message ?? "Error executing SQL",
-      },
-      400
-    );
+    return json({ ok: false, error: error?.message ?? "Error executing SQL" }, 400);
   }
+}
+
+/* =========================
+   Experiments / benchmark
+========================= */
+
+async function getExperimentDetails(db: D1Database, experimentId: number) {
+  const experiment = await fetchSingle(db, "SELECT * FROM experiments WHERE id = ?", [experimentId]);
+  if (!experiment) return null;
+
+  const runs = await fetchRows(db, "SELECT * FROM model_runs WHERE experiment_id = ? ORDER BY id ASC", [experimentId]);
+
+  const runIds = runs.map((r: any) => Number(r.id));
+  const placeholders = runIds.map(() => "?").join(",");
+
+  const configs =
+    runIds.length > 0
+      ? await fetchRows(db, `SELECT * FROM model_configs WHERE run_id IN (${placeholders})`, runIds)
+      : [];
+
+  const metrics =
+    runIds.length > 0
+      ? await fetchRows(db, `SELECT * FROM metrics WHERE run_id IN (${placeholders}) ORDER BY id ASC`, runIds)
+      : [];
+
+  const artifacts =
+    runIds.length > 0
+      ? await fetchRows(db, `SELECT * FROM artifacts WHERE run_id IN (${placeholders}) ORDER BY id ASC`, runIds)
+      : [];
+
+  const configByRun = new Map<number, any>();
+  for (const cfg of configs as any[]) configByRun.set(Number(cfg.run_id), cfg);
+
+  const metricsByRun = new Map<number, any[]>();
+  for (const metric of metrics as any[]) {
+    const runId = Number(metric.run_id);
+    metricsByRun.set(runId, [...(metricsByRun.get(runId) ?? []), metric]);
+  }
+
+  const artifactsByRun = new Map<number, any[]>();
+  for (const art of artifacts as any[]) {
+    const runId = Number(art.run_id);
+    artifactsByRun.set(runId, [...(artifactsByRun.get(runId) ?? []), art]);
+  }
+
+  const runsWithDetails = (runs as any[]).map((run) => ({
+    ...run,
+    config: configByRun.get(Number(run.id)) ?? null,
+    metrics: metricsByRun.get(Number(run.id)) ?? [],
+    artifacts: artifactsByRun.get(Number(run.id)) ?? [],
+  }));
+
+  const leaderboard = runsWithDetails
+    .map((run) => {
+      const metricMap = new Map<string, number>();
+      for (const metric of run.metrics ?? []) {
+        metricMap.set(metric.metric_name, Number(metric.metric_value));
+      }
+
+      const score =
+        metricMap.get("score") ??
+        metricMap.get("f1") ??
+        metricMap.get("r2") ??
+        metricMap.get("accuracy") ??
+        null;
+
+      return { ...run, score };
+    })
+    .sort((a, b) => {
+      const aOk = a.status !== "failed" && a.score !== null;
+      const bOk = b.status !== "failed" && b.score !== null;
+      if (aOk !== bOk) return aOk ? -1 : 1;
+      return Number(b.score ?? -Infinity) - Number(a.score ?? -Infinity);
+    });
+
+  return {
+    experiment,
+    runs: runsWithDetails,
+    leaderboard,
+  };
+}
+
+async function listExperiments(db: D1Database, datasetId?: number) {
+  const experiments = datasetId
+    ? await fetchRows(db, "SELECT * FROM experiments WHERE dataset_id = ? ORDER BY id DESC", [datasetId])
+    : await fetchRows(db, "SELECT * FROM experiments ORDER BY id DESC");
+
+  const out = [];
+  for (const exp of experiments as any[]) {
+    const details = await getExperimentDetails(db, Number(exp.id));
+    if (!details) continue;
+
+    out.push({
+      id: exp.id,
+      dataset_id: exp.dataset_id,
+      experiment_name: exp.experiment_name,
+      problem_type: exp.problem_type,
+      task_type: exp.task_type ?? exp.problem_type ?? null,
+      target_column: exp.target_column,
+      train_size: exp.train_size,
+      test_size: exp.test_size,
+      train_split: exp.train_split ?? null,
+      random_state: exp.random_state,
+      results_json: exp.results_json ?? null,
+      hyperparams_json: exp.hyperparams_json ?? null,
+      feature_columns_json: exp.feature_columns_json ?? null,
+      created_at: exp.created_at,
+      run_count: details.runs.length,
+      failed_runs: details.runs.filter((r: any) => r.status === "failed").length,
+      best_model: details.leaderboard[0]?.model_name ?? null,
+      best_score: details.leaderboard[0]?.score ?? null,
+      leaderboard: details.leaderboard,
+    });
+  }
+
+  return out;
+}
+
+function buildRunResult(
+  datasetId: number,
+  taskType: TaskType,
+  modelName: string,
+  params: Record<string, string | number | boolean>,
+  targetColumn: string,
+  trainSplit: number
+): BenchRun {
+  const seed = stableNoise(datasetId, taskType, modelName, targetColumn, trainSplit, JSON.stringify(params));
+  const failSeed = stableNoise("fail", datasetId, taskType, modelName, targetColumn);
+  const failureChance = 0.14 + (modelName === "SVM" ? 0.04 : 0) + (modelName === "KNN" ? 0.02 : 0);
+  const success = failSeed > failureChance;
+  const duration_ms = Math.round(350 + seed * 2600);
+
+  if (!success) {
+    return {
+      model: modelName,
+      success: false,
+      score: null,
+      error: "Training failed: feature mismatch / convergence / numerical issue",
+      duration_ms,
+      params,
+    };
+  }
+
+  if (taskType === "classification") {
+    const accuracy = Number((0.68 + seed * 0.28).toFixed(4));
+    const precision = Number(Math.max(0.5, accuracy - 0.04 + seed * 0.03).toFixed(4));
+    const recall = Number(Math.max(0.5, accuracy - 0.03 + seed * 0.02).toFixed(4));
+    const f1 = Number(((2 * precision * recall) / (precision + recall)).toFixed(4));
+    const roc_auc = Number(Math.min(0.99, accuracy + 0.04 + seed * 0.02).toFixed(4));
+
+    return {
+      model: modelName,
+      success: true,
+      score: f1,
+      duration_ms,
+      params,
+      metrics: { accuracy, precision, recall, f1, roc_auc, score: f1 },
+    };
+  }
+
+  const r2 = Number((0.55 + seed * 0.4).toFixed(4));
+  const rmse = Number((5 + (1 - r2) * 30).toFixed(4));
+  const mae = Number((rmse * 0.76).toFixed(4));
+
+  return {
+    model: modelName,
+    success: true,
+    score: r2,
+    duration_ms,
+    params,
+    metrics: { rmse, mae, r2, score: r2 },
+  };
+}
+
+async function persistBenchmark(
+  db: D1Database,
+  input: {
+    datasetId: number;
+    taskType: TaskType;
+    targetColumn: string;
+    trainSplit: number;
+    experimentName: string;
+    selectedModels: string[];
+    randomState: number;
+    paramsByModel?: Record<string, Record<string, string | number | boolean>>;
+    featureColumns?: string[];
+  }
+) {
+  const experimentInsert = await db
+    .prepare(
+      `INSERT INTO experiments (
+        dataset_id, experiment_name, problem_type, target_column, train_size, test_size, random_state,
+        task_type, train_split, results_json, hyperparams_json, feature_columns_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      input.datasetId,
+      input.experimentName,
+      input.taskType,
+      input.targetColumn,
+      input.trainSplit / 100,
+      (100 - input.trainSplit) / 100,
+      input.randomState,
+      input.taskType,
+      input.trainSplit,
+      null,
+      JSON.stringify(input.paramsByModel ?? {}),
+      JSON.stringify(input.featureColumns ?? [])
+    )
+    .run();
+
+  const experimentId = Number(experimentInsert.meta.last_row_id);
+  const results: BenchRun[] = [];
+  let firstRunId: number | null = null;
+
+  for (const modelName of input.selectedModels) {
+    const params = {
+      ...getDefaultParams(modelName),
+      ...(input.paramsByModel?.[modelName] ?? {}),
+    };
+
+    const run = buildRunResult(
+      input.datasetId,
+      input.taskType,
+      modelName,
+      params,
+      input.targetColumn,
+      input.trainSplit
+    );
+
+    const runInsert = await db
+      .prepare(
+        `INSERT INTO model_runs (
+          experiment_id, model_name, status, started_at, finished_at, duration_ms, error_message
+        ) VALUES (?, ?, ?, datetime('now'), datetime('now'), ?, ?)`
+      )
+      .bind(
+        experimentId,
+        modelName,
+        run.success ? "done" : "failed",
+        run.duration_ms,
+        run.error ?? null
+      )
+      .run();
+
+    const runId = Number(runInsert.meta.last_row_id);
+    if (!firstRunId) firstRunId = runId;
+
+    await db
+      .prepare(`INSERT INTO model_configs (run_id, params_json) VALUES (?, ?)`)
+      .bind(runId, JSON.stringify(params))
+      .run();
+
+    if (run.metrics) {
+      for (const [metricName, metricValue] of Object.entries(run.metrics)) {
+        await db
+          .prepare(`INSERT INTO metrics (run_id, metric_name, metric_value) VALUES (?, ?, ?)`)
+          .bind(runId, metricName, metricValue)
+          .run();
+      }
+    }
+
+    await db
+      .prepare(`INSERT INTO artifacts (run_id, artifact_type, artifact_key) VALUES (?, ?, ?)`)
+      .bind(runId, "run_summary", `experiments/${experimentId}/runs/${runId}.json`)
+      .run();
+
+    results.push({ ...run, params });
+  }
+
+  const ranking = [...results].sort((a, b) => Number(b.score ?? -999) - Number(a.score ?? -999));
+
+  if (firstRunId) {
+    await db
+      .prepare(`INSERT INTO artifacts (run_id, artifact_type, artifact_key) VALUES (?, ?, ?)`)
+      .bind(firstRunId, "leaderboard", `experiments/${experimentId}/leaderboard.json`)
+      .run();
+  }
+
+  await db
+    .prepare(`UPDATE experiments SET results_json = ?, hyperparams_json = ? WHERE id = ?`)
+    .bind(
+      JSON.stringify({ ranking, runs: results }),
+      JSON.stringify(input.paramsByModel ?? {}),
+      experimentId
+    )
+    .run();
+
+  return { experimentId, results, ranking };
 }
 
 async function handleBenchmark(db: D1Database, body: any, single = false) {
@@ -1476,7 +1333,7 @@ async function handleBenchmark(db: D1Database, body: any, single = false) {
         featureColumns = parsed.map(String).map((v: string) => v.trim()).filter(Boolean);
       }
     } catch {
-      // ignore parsing issues and fall back below
+      // ignore
     }
   }
 
@@ -1529,6 +1386,10 @@ async function getModelSpecPayload() {
     classification: CLASSIFICATION_MODELS,
   };
 }
+
+/* =========================
+   Router
+========================= */
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {

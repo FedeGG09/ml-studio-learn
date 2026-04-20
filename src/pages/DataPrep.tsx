@@ -1,27 +1,24 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { datasetsApi } from "@/api/datasets";
-import { apiPost } from "@/api/client";
+import { useQuery } from "@tanstack/react-query";
 import { ExplanationBox } from "@/components/ExplanationBox";
 import { MetricCard } from "@/components/MetricCard";
 import {
   AlertTriangle,
   CheckCircle2,
-  ChevronDown,
+  Columns,
   Database,
   FileText,
   Plus,
   Rocket,
   Save,
   Trash2,
-  WandSparkles,
   Wrench,
 } from "lucide-react";
 
 type DerivedOp = "concat" | "sum" | "difference" | "product" | "ratio";
 
-type DerivedColumnRow = {
+type DerivedRow = {
   id: string;
   name: string;
   op: DerivedOp;
@@ -30,32 +27,107 @@ type DerivedColumnRow = {
   separator: string;
 };
 
-function makeId() {
+type DatasetRow = {
+  id: number;
+  name: string;
+  description?: string | null;
+  source_type?: string | null;
+  storage_key?: string | null;
+  preview_key?: string | null;
+  row_count?: number | null;
+  column_count?: number | null;
+  target_column?: string | null;
+  inferred_problem_type?: "regression" | "classification";
+};
+
+type ColumnRow = {
+  id?: number;
+  column_name: string;
+  data_type: string;
+  is_target?: number;
+  has_nulls?: number;
+  null_count?: number;
+  unique_count?: number;
+};
+
+type ProfileResponse = {
+  ok: boolean;
+  dataset: DatasetRow;
+  columns: ColumnRow[];
+  preview: Record<string, unknown>[];
+  stats: Record<string, unknown>;
+};
+
+type PrepareResponse = {
+  ok: boolean;
+  prepared_dataset_id: number;
+  preparation_id: number;
+  table_name: string;
+  dataset: DatasetRow;
+  columns: ColumnRow[];
+  preview: Record<string, unknown>[];
+  stats: Record<string, unknown>;
+  error?: string;
+};
+
+function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
-function isNumericType(type?: string) {
-  return ["INTEGER", "REAL"].includes(String(type || "").toUpperCase());
+async function apiGet<T>(path: string): Promise<T> {
+  const res = await fetch(path);
+  const data = await res.json().catch(() => null);
+  if (!res.ok || (data && data.ok === false)) {
+    throw new Error(data?.error || `Error GET ${path}`);
+  }
+  return data as T;
+}
+
+async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || (data && data.ok === false)) {
+    throw new Error(data?.error || `Error POST ${path}`);
+  }
+  return data as T;
+}
+
+function isNumericType(t?: string) {
+  return ["INTEGER", "REAL"].includes(String(t || "").toUpperCase());
+}
+
+function defaultSelectedMap(columns: ColumnRow[], targetColumn: string) {
+  const out: Record<string, boolean> = {};
+  columns.forEach((c) => {
+    if (c.column_name !== targetColumn) out[c.column_name] = true;
+  });
+  return out;
+}
+
+function defaultRenameMap(columns: ColumnRow[]) {
+  const out: Record<string, string> = {};
+  columns.forEach((c) => {
+    out[c.column_name] = "";
+  });
+  return out;
 }
 
 export default function DataPrep() {
   const [searchParams, setSearchParams] = useSearchParams();
   const datasetIdFromUrl = Number(searchParams.get("datasetId") || 0);
 
-  const { data: datasetsData } = useQuery({
-    queryKey: ["datasets"],
-    queryFn: () => datasetsApi.list(),
-  });
-
   const [selectedDatasetId, setSelectedDatasetId] = useState<number>(datasetIdFromUrl);
   const [versionName, setVersionName] = useState("Prepared version");
   const [targetColumn, setTargetColumn] = useState("");
-  const [selectedFeatures, setSelectedFeatures] = useState<Record<string, boolean>>({});
+  const [selectedMap, setSelectedMap] = useState<Record<string, boolean>>({});
   const [renameMap, setRenameMap] = useState<Record<string, string>>({});
-  const [derivedColumns, setDerivedColumns] = useState<DerivedColumnRow[]>([]);
-  const [saveResult, setSaveResult] = useState<any>(null);
-
-  const initializedForDatasetRef = useRef<number | null>(null);
+  const [derivedRows, setDerivedRows] = useState<DerivedRow[]>([]);
+  const [result, setResult] = useState<PrepareResponse | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
     if (datasetIdFromUrl && datasetIdFromUrl !== selectedDatasetId) {
@@ -63,102 +135,107 @@ export default function DataPrep() {
     }
   }, [datasetIdFromUrl, selectedDatasetId]);
 
-  useEffect(() => {
-    const firstId = datasetsData?.datasets?.[0]?.id;
-    if (!selectedDatasetId && firstId) {
-      setSelectedDatasetId(Number(firstId));
-      setSearchParams({ datasetId: String(firstId) });
-    }
-  }, [datasetsData, selectedDatasetId, setSearchParams]);
+  const { data: datasetsData } = useQuery({
+    queryKey: ["datasets"],
+    queryFn: () => apiGet<{ ok: boolean; datasets: DatasetRow[] }>("/api/datasets"),
+  });
 
-  const activeDatasetId = selectedDatasetId || datasetIdFromUrl || Number(datasetsData?.datasets?.[0]?.id || 0);
+  const activeDatasetId =
+    selectedDatasetId || datasetIdFromUrl || Number(datasetsData?.datasets?.[0]?.id || 0);
 
-  const { data, isLoading, error } = useQuery({
+  const { data: profileData, isLoading, error } = useQuery({
     queryKey: ["dataset-profile", activeDatasetId],
-    queryFn: () => datasetsApi.profile(activeDatasetId),
+    queryFn: () => apiGet<ProfileResponse>(`/api/datasets/${activeDatasetId}/profile`),
     enabled: !!activeDatasetId,
   });
 
+  const columns = profileData?.columns ?? [];
+  const preview = profileData?.preview ?? [];
+  const dataset = profileData?.dataset ?? datasetsData?.datasets?.find((d) => Number(d.id) === Number(activeDatasetId));
+  const stats = profileData?.stats ?? {};
+
   useEffect(() => {
-    if (!data?.ok || !activeDatasetId) return;
+    if (!profileData?.ok || !activeDatasetId) return;
 
-    if (initializedForDatasetRef.current === activeDatasetId) return;
+    setLocalError(null);
+    setResult(null);
 
-    const cols = data.columns || [];
     const currentTarget =
-      cols.find((c: any) => Number(c.is_target) === 1)?.column_name ||
-      data.dataset?.target_column ||
-      cols[cols.length - 1]?.column_name ||
+      columns.find((c) => Number(c.is_target) === 1)?.column_name ||
+      dataset?.target_column ||
+      columns[columns.length - 1]?.column_name ||
       "";
 
     setTargetColumn(currentTarget);
+    setSelectedMap(defaultSelectedMap(columns, currentTarget));
+    setRenameMap(defaultRenameMap(columns));
+    setDerivedRows([]);
     setVersionName("Prepared version");
-    setSelectedFeatures(
-      cols.reduce((acc: Record<string, boolean>, col: any) => {
-        if (col.column_name && col.column_name !== currentTarget) {
-          acc[col.column_name] = true;
-        }
-        return acc;
-      }, {})
-    );
-    setRenameMap(
-      cols.reduce((acc: Record<string, string>, col: any) => {
-        if (col.column_name) acc[col.column_name] = "";
-        return acc;
-      }, {})
-    );
-    setDerivedColumns([]);
-    setSaveResult(null);
-    initializedForDatasetRef.current = activeDatasetId;
-  }, [data, activeDatasetId]);
+  }, [profileData, activeDatasetId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectedDataset = useMemo(() => {
-    return datasetsData?.datasets?.find((d: any) => Number(d.id) === Number(activeDatasetId)) ?? null;
-  }, [datasetsData, activeDatasetId]);
+  const numericColumns = useMemo(
+    () => columns.filter((c) => isNumericType(c.data_type)).length,
+    [columns]
+  );
 
-  const columns = data?.columns ?? [];
-  const preview = data?.preview ?? [];
-  const dataset = data?.dataset ?? selectedDataset ?? null;
-  const stats = data?.stats ?? {};
+  const totalNulls = useMemo(
+    () => columns.reduce((acc, c) => acc + Number(c.null_count || 0), 0),
+    [columns]
+  );
 
-  const selectedFeatureList = columns
-    .map((c: any) => c.column_name)
-    .filter((name: string) => selectedFeatures[name]);
+  const selectedCount = useMemo(
+    () => Object.entries(selectedMap).filter(([, v]) => v).length,
+    [selectedMap]
+  );
 
-  const totalNulls = columns.reduce((acc: number, col: any) => acc + Number(col.null_count || 0), 0);
-  const numericColumns = columns.filter((c: any) => isNumericType(c.data_type)).length;
+  const visibleColumnOptions = useMemo(
+    () => columns.map((c) => c.column_name).filter((name) => name !== targetColumn),
+    [columns, targetColumn]
+  );
 
-  const allFeatureCandidates = columns.filter((c: any) => c.column_name !== targetColumn);
+  const problemType = dataset?.inferred_problem_type || "classification";
 
-  const prepareMutation = useMutation({
-    mutationFn: async () => {
-      if (!activeDatasetId) {
-        throw new Error("Seleccioná un dataset");
-      }
+  async function handlePrepare() {
+    if (!activeDatasetId) {
+      setLocalError("Seleccioná un dataset.");
+      return;
+    }
 
-      const payload = {
-        versionName,
-        targetColumn,
-        selectedFeatures: selectedFeatureList,
-        renameMap,
-        derivedColumns: derivedColumns
-          .filter((row) => row.name.trim() && row.left.trim())
-          .map((row) => ({
-            name: row.name.trim(),
-            op: row.op,
-            left: row.left.trim(),
-            right: row.right.trim() || undefined,
-            separator: row.separator,
-          })),
-        taskType: dataset?.inferred_problem_type || "classification",
-      };
+    const selectedFeatures = columns
+      .map((c) => c.column_name)
+      .filter((name) => selectedMap[name] && name !== targetColumn);
 
-      return apiPost(`/api/datasets/${activeDatasetId}/prepare`, payload);
-    },
-    onSuccess: (result) => {
-      setSaveResult(result);
-    },
-  });
+    if (selectedFeatures.length === 0) {
+      setLocalError("Seleccioná al menos una feature.");
+      return;
+    }
+
+    const payload = {
+      versionName,
+      targetColumn,
+      selectedFeatures,
+      renameMap,
+      derivedColumns: derivedRows
+        .filter((r) => r.name.trim() && r.left.trim())
+        .map((r) => ({
+          name: r.name.trim(),
+          op: r.op,
+          left: r.left.trim(),
+          right: r.right.trim() || undefined,
+          separator: r.separator,
+        })),
+      taskType: problemType,
+    };
+
+    setLocalError(null);
+
+    try {
+      const prepared = await apiPost<PrepareResponse>(`/api/datasets/${activeDatasetId}/prepare`, payload);
+      setResult(prepared);
+    } catch (e: any) {
+      setLocalError(e?.message || "Error preparando el dataset");
+    }
+  }
 
   if (isLoading && activeDatasetId) {
     return <div className="p-6">Cargando Data Prep...</div>;
@@ -167,10 +244,6 @@ export default function DataPrep() {
   if (error) {
     return <div className="p-6 text-red-500">Error cargando dataset</div>;
   }
-
-  const preparedDatasetId = saveResult?.prepared_dataset_id ?? saveResult?.dataset?.id;
-  const preparedTarget = saveResult?.dataset?.target_column ?? targetColumn;
-  const problemType = dataset?.inferred_problem_type || "classification";
 
   return (
     <div className="space-y-8 max-w-7xl">
@@ -186,62 +259,49 @@ export default function DataPrep() {
           </p>
         </div>
 
-        <div className="flex flex-wrap gap-3">
-          {preparedDatasetId ? (
-            <Link
-              to={`/model-lab?datasetId=${preparedDatasetId}&target=${encodeURIComponent(preparedTarget)}&problemType=${problemType}`}
-              className="inline-flex items-center gap-2 rounded-xl px-5 py-3 bg-primary text-primary-foreground hover:opacity-90 transition-all shadow-lg"
-            >
-              <Rocket className="h-4 w-4" />
-              Ir a Model Lab
-            </Link>
-          ) : null}
-        </div>
+        {result?.prepared_dataset_id ? (
+          <Link
+            to={`/model-lab?datasetId=${result.prepared_dataset_id}&target=${encodeURIComponent(
+              result.dataset?.target_column || targetColumn
+            )}&problemType=${problemType}`}
+            className="inline-flex items-center gap-2 rounded-xl px-5 py-3 bg-primary text-primary-foreground hover:opacity-90 transition-all shadow-lg"
+          >
+            <Rocket className="h-4 w-4" />
+            Ir a Model Lab
+          </Link>
+        ) : null}
       </div>
 
       <ExplanationBox
-        technicalTitle="Técnico: qué hace esta pantalla"
-        technicalContent="Permite seleccionar features, renombrar columnas, crear columnas derivadas y guardar una versión procesada del dataset en D1."
-        didacticTitle="Simple: para qué sirve"
-        didacticContent="Acá dejás el dataset listo antes de entrenar: elegís qué columnas usar, limpiás nombres y armás variables nuevas."
+        technicalTitle="Técnico"
+        technicalContent="Esta pantalla prepara una versión nueva del dataset en D1: permite elegir variables, renombrar columnas, crear derivadas y persistir la preparación."
+        didacticTitle="Simple"
+        didacticContent="Acá dejás los datos listos para entrenar: elegís qué usar, cómo se llaman las columnas y qué variables nuevas querés crear."
       />
 
       <div className="glass-card p-5 space-y-4">
-        <div className="flex flex-col lg:flex-row lg:items-end gap-4 justify-between">
-          <div className="flex-1">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div>
             <label className="block text-sm font-medium mb-2">Dataset activo</label>
-            <div className="flex flex-col sm:flex-row gap-3">
-              <select
-                value={activeDatasetId || ""}
-                onChange={(e) => {
-                  const nextId = Number(e.target.value);
-                  setSelectedDatasetId(nextId);
-                  setSearchParams(nextId ? { datasetId: String(nextId) } : {});
-                  initializedForDatasetRef.current = null;
-                  setSaveResult(null);
-                }}
-                className="w-full sm:w-[320px] rounded-xl border border-border bg-background px-4 py-3 text-sm"
-              >
-                <option value="">Elegí un dataset</option>
-                {(datasetsData?.datasets ?? []).map((d: any) => (
-                  <option key={d.id} value={d.id}>
-                    {d.name}
-                  </option>
-                ))}
-              </select>
-
-              {dataset ? (
-                <Link
-                  to={`/datasets/${activeDatasetId}`}
-                  className="inline-flex items-center gap-2 rounded-xl px-4 py-3 border border-border hover:border-primary transition-all"
-                >
-                  Ver dataset
-                </Link>
-              ) : null}
-            </div>
+            <select
+              value={activeDatasetId || ""}
+              onChange={(e) => {
+                const nextId = Number(e.target.value);
+                setSelectedDatasetId(nextId);
+                setSearchParams(nextId ? { datasetId: String(nextId) } : {});
+              }}
+              className="w-full rounded-xl border border-border bg-background px-4 py-3 text-sm"
+            >
+              <option value="">Elegí un dataset</option>
+              {(datasetsData?.datasets || []).map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.name}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div className="flex-1">
+          <div>
             <label className="block text-sm font-medium mb-2">Nombre de la versión</label>
             <input
               value={versionName}
@@ -256,10 +316,10 @@ export default function DataPrep() {
       {dataset ? (
         <>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <MetricCard title="Columnas" value={dataset.column_count} icon={<Database className="h-5 w-5" />} />
-            <MetricCard title="Filas" value={dataset.row_count} icon={<FileText className="h-5 w-5" />} />
+            <MetricCard title="Columnas" value={dataset.column_count ?? columns.length} icon={<Columns className="h-5 w-5" />} />
+            <MetricCard title="Filas" value={dataset.row_count ?? 0} icon={<FileText className="h-5 w-5" />} />
             <MetricCard title="Nulos" value={totalNulls} icon={<AlertTriangle className="h-5 w-5" />} />
-            <MetricCard title="Numéricas" value={numericColumns} icon={<WandSparkles className="h-5 w-5" />} />
+            <MetricCard title="Numéricas" value={numericColumns} icon={<Database className="h-5 w-5" />} />
           </div>
 
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -267,7 +327,7 @@ export default function DataPrep() {
               <div className="flex items-center justify-between gap-3 mb-4">
                 <h3 className="font-heading font-semibold text-sm">Features y target</h3>
                 <span className="text-xs text-muted-foreground">
-                  {selectedFeatureList.length} features seleccionadas
+                  {selectedCount} seleccionadas
                 </span>
               </div>
 
@@ -283,17 +343,17 @@ export default function DataPrep() {
                     </tr>
                   </thead>
                   <tbody>
-                    {columns.map((col: any) => {
+                    {columns.map((col) => {
                       const isTarget = col.column_name === targetColumn;
                       return (
                         <tr key={col.id ?? col.column_name}>
                           <td>
                             <input
                               type="checkbox"
-                              checked={!!selectedFeatures[col.column_name]}
+                              checked={!!selectedMap[col.column_name]}
                               disabled={isTarget}
                               onChange={(e) =>
-                                setSelectedFeatures((prev) => ({
+                                setSelectedMap((prev) => ({
                                   ...prev,
                                   [col.column_name]: e.target.checked,
                                 }))
@@ -322,7 +382,14 @@ export default function DataPrep() {
                                 type="radio"
                                 name="targetColumn"
                                 checked={isTarget}
-                                onChange={() => setTargetColumn(col.column_name)}
+                                onChange={() => {
+                                  setTargetColumn(col.column_name);
+                                  setSelectedMap((prev) => {
+                                    const next = { ...prev };
+                                    next[col.column_name] = false;
+                                    return next;
+                                  });
+                                }}
                               />
                               {isTarget ? "🎯" : "-"}
                             </label>
@@ -335,10 +402,7 @@ export default function DataPrep() {
               </div>
 
               <div className="mt-4 rounded-xl border border-border/60 bg-muted/20 p-4 text-xs text-muted-foreground">
-                <p className="font-medium text-foreground mb-1">Sugerencia</p>
-                <p>
-                  Dejá como target la columna que querés predecir. El resto queda como features de entrenamiento.
-                </p>
+                Dejá como target la columna que querés predecir. El resto queda disponible como feature.
               </div>
             </div>
 
@@ -348,10 +412,10 @@ export default function DataPrep() {
                 <button
                   type="button"
                   onClick={() =>
-                    setDerivedColumns((prev) => [
+                    setDerivedRows((prev) => [
                       ...prev,
                       {
-                        id: makeId(),
+                        id: uid(),
                         name: "",
                         op: "concat",
                         left: "",
@@ -368,21 +432,19 @@ export default function DataPrep() {
               </div>
 
               <div className="space-y-3">
-                {derivedColumns.length === 0 ? (
+                {derivedRows.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
                     No hay columnas derivadas todavía.
                   </div>
                 ) : null}
 
-                {derivedColumns.map((row, index) => (
+                {derivedRows.map((row, index) => (
                   <div key={row.id} className="rounded-2xl border border-border/60 p-4 space-y-3">
                     <div className="flex items-center justify-between gap-3">
                       <div className="text-sm font-medium">Derivada #{index + 1}</div>
                       <button
                         type="button"
-                        onClick={() =>
-                          setDerivedColumns((prev) => prev.filter((item) => item.id !== row.id))
-                        }
+                        onClick={() => setDerivedRows((prev) => prev.filter((item) => item.id !== row.id))}
                         className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs border border-border hover:border-destructive hover:text-destructive transition-all"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -396,10 +458,8 @@ export default function DataPrep() {
                         <input
                           value={row.name}
                           onChange={(e) =>
-                            setDerivedColumns((prev) =>
-                              prev.map((item) =>
-                                item.id === row.id ? { ...item, name: e.target.value } : item
-                              )
+                            setDerivedRows((prev) =>
+                              prev.map((item) => (item.id === row.id ? { ...item, name: e.target.value } : item))
                             )
                           }
                           className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
@@ -412,11 +472,9 @@ export default function DataPrep() {
                         <select
                           value={row.op}
                           onChange={(e) =>
-                            setDerivedColumns((prev) =>
+                            setDerivedRows((prev) =>
                               prev.map((item) =>
-                                item.id === row.id
-                                  ? { ...item, op: e.target.value as DerivedOp }
-                                  : item
+                                item.id === row.id ? { ...item, op: e.target.value as DerivedOp } : item
                               )
                             )
                           }
@@ -435,7 +493,7 @@ export default function DataPrep() {
                         <select
                           value={row.left}
                           onChange={(e) =>
-                            setDerivedColumns((prev) =>
+                            setDerivedRows((prev) =>
                               prev.map((item) =>
                                 item.id === row.id ? { ...item, left: e.target.value } : item
                               )
@@ -444,9 +502,9 @@ export default function DataPrep() {
                           className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
                         >
                           <option value="">Elegí una columna</option>
-                          {allFeatureCandidates.map((col: any) => (
-                            <option key={col.column_name} value={col.column_name}>
-                              {col.column_name}
+                          {visibleColumnOptions.map((col) => (
+                            <option key={col} value={col}>
+                              {col}
                             </option>
                           ))}
                         </select>
@@ -457,7 +515,7 @@ export default function DataPrep() {
                         <select
                           value={row.right}
                           onChange={(e) =>
-                            setDerivedColumns((prev) =>
+                            setDerivedRows((prev) =>
                               prev.map((item) =>
                                 item.id === row.id ? { ...item, right: e.target.value } : item
                               )
@@ -466,9 +524,9 @@ export default function DataPrep() {
                           className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm"
                         >
                           <option value="">Opcional</option>
-                          {allFeatureCandidates.map((col: any) => (
-                            <option key={col.column_name} value={col.column_name}>
-                              {col.column_name}
+                          {visibleColumnOptions.map((col) => (
+                            <option key={col} value={col}>
+                              {col}
                             </option>
                           ))}
                         </select>
@@ -479,7 +537,7 @@ export default function DataPrep() {
                         <input
                           value={row.separator}
                           onChange={(e) =>
-                            setDerivedColumns((prev) =>
+                            setDerivedRows((prev) =>
                               prev.map((item) =>
                                 item.id === row.id ? { ...item, separator: e.target.value } : item
                               )
@@ -493,14 +551,6 @@ export default function DataPrep() {
                   </div>
                 ))}
               </div>
-
-              <div className="mt-4 rounded-xl border border-border/60 bg-muted/20 p-4 text-xs text-muted-foreground">
-                <p className="font-medium text-foreground mb-1">Uso rápido</p>
-                <p>
-                  <b>concat</b> une texto, <b>sum</b> suma, <b>difference</b> resta, <b>product</b> multiplica y{" "}
-                  <b>ratio</b> divide con control de cero.
-                </p>
-              </div>
             </div>
           </div>
 
@@ -509,28 +559,28 @@ export default function DataPrep() {
               <div>
                 <h3 className="font-heading font-semibold text-sm">Guardar versión procesada</h3>
                 <p className="text-xs text-muted-foreground mt-1">
-                  Se crea una nueva tabla en D1, se guarda la selección de variables y queda lista para Model Lab.
+                  Se crea una nueva tabla en D1 y queda lista para entrenamiento.
                 </p>
               </div>
 
               <button
                 type="button"
-                onClick={() => prepareMutation.mutate()}
-                disabled={prepareMutation.isPending || !targetColumn || selectedFeatureList.length === 0}
+                onClick={handlePrepare}
+                disabled={!targetColumn || selectedCount === 0}
                 className="inline-flex items-center gap-2 rounded-xl px-5 py-3 bg-primary text-primary-foreground hover:opacity-90 transition-all disabled:opacity-50"
               >
                 <Save className="h-4 w-4" />
-                {prepareMutation.isPending ? "Guardando..." : "Create version"}
+                Crear versión
               </button>
             </div>
 
-            {prepareMutation.isError ? (
+            {localError ? (
               <div className="mt-4 rounded-xl border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
-                {(prepareMutation.error as Error)?.message || "Error guardando la preparación"}
+                {localError}
               </div>
             ) : null}
 
-            {saveResult?.ok ? (
+            {result?.ok ? (
               <div className="mt-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-5 space-y-3">
                 <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-400 font-medium">
                   <CheckCircle2 className="h-5 w-5" />
@@ -540,27 +590,27 @@ export default function DataPrep() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
                   <div className="rounded-xl border border-emerald-500/20 bg-background/60 p-3">
                     <div className="text-xs text-muted-foreground">Nuevo dataset</div>
-                    <div className="font-medium">{saveResult.dataset?.name}</div>
-                    <div className="text-xs text-muted-foreground">ID {saveResult.prepared_dataset_id}</div>
+                    <div className="font-medium">{result.dataset?.name}</div>
+                    <div className="text-xs text-muted-foreground">ID {result.prepared_dataset_id}</div>
                   </div>
 
                   <div className="rounded-xl border border-emerald-500/20 bg-background/60 p-3">
                     <div className="text-xs text-muted-foreground">Tabla creada</div>
-                    <div className="font-medium">{saveResult.table_name}</div>
-                    <div className="text-xs text-muted-foreground">Target: {saveResult.dataset?.target_column}</div>
+                    <div className="font-medium">{result.table_name}</div>
+                    <div className="text-xs text-muted-foreground">Target: {result.dataset?.target_column}</div>
                   </div>
                 </div>
 
                 <div className="flex flex-wrap gap-3">
                   <Link
-                    to={`/datasets/${saveResult.prepared_dataset_id}`}
+                    to={`/datasets/${result.prepared_dataset_id}`}
                     className="inline-flex items-center gap-2 rounded-xl px-4 py-2 border border-emerald-500/30 hover:bg-emerald-500/10 transition-all"
                   >
                     Ver dataset preparado
                   </Link>
                   <Link
-                    to={`/model-lab?datasetId=${saveResult.prepared_dataset_id}&target=${encodeURIComponent(
-                      saveResult.dataset?.target_column || targetColumn
+                    to={`/model-lab?datasetId=${result.prepared_dataset_id}&target=${encodeURIComponent(
+                      result.dataset?.target_column || targetColumn
                     )}&problemType=${problemType}`}
                     className="inline-flex items-center gap-2 rounded-xl px-4 py-2 bg-emerald-600 text-white hover:opacity-90 transition-all"
                   >
@@ -586,12 +636,12 @@ export default function DataPrep() {
                   </tr>
                 </thead>
                 <tbody>
-                  {columns.map((col: any) => (
-                    <tr key={col.id}>
+                  {columns.map((col) => (
+                    <tr key={col.id ?? col.column_name}>
                       <td>{col.column_name}</td>
                       <td>{col.data_type}</td>
-                      <td>{col.null_count}</td>
-                      <td>{col.unique_count}</td>
+                      <td>{col.null_count ?? 0}</td>
+                      <td>{col.unique_count ?? 0}</td>
                       <td>{col.is_target ? "🎯" : "-"}</td>
                     </tr>
                   ))}
@@ -614,7 +664,7 @@ export default function DataPrep() {
                 <tbody>
                   {preview.map((row: any, idx: number) => (
                     <tr key={idx}>
-                      {Object.values(row).map((value: any, i) => (
+                      {Object.values(row).map((value: any, i: number) => (
                         <td key={i}>{String(value)}</td>
                       ))}
                     </tr>
@@ -626,7 +676,7 @@ export default function DataPrep() {
 
           <div className="glass-card p-5">
             <h3 className="font-heading font-semibold text-sm mb-4">Estadísticas</h3>
-            <pre className="text-xs">{JSON.stringify(stats, null, 2)}</pre>
+            <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(stats, null, 2)}</pre>
           </div>
         </>
       ) : (
